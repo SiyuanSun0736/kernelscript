@@ -1,0 +1,22 @@
+flowchart LR
+    subgraph S[examples/multi_programs.ks]
+        A["include xdp.kh / tc.kh"]
+        B["pin var shared_counter"]
+        C["@xdp packet_counter"]
+        D["@tc ingress packet_filter"]
+        E["fn main"]
+    end
+
+    A --> F["Expanded declarations"]
+    B --> G["Shared global map"]
+    C --> H["eBPF program 1"]
+    D --> I["eBPF program 2"]
+    E --> J["Userspace coordinator"]
+
+    G --> H
+    G --> I
+    G --> J
+
+    H --> K["foo.ebpf.c sections"]
+    I --> K
+    J --> L["foo.c loader / attach / detach"]

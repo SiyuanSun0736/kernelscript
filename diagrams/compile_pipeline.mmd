@@ -1,0 +1,13 @@
+flowchart TD
+    A[examples/multi_programs.ks] --> B[Parse<br/>lexer.mll / parser.mly]
+    B --> C[Import Resolution<br/>import_resolver.ml]
+    C --> D[Include Expansion<br/>include_resolver.ml]
+    D --> E[Symbol Table<br/>symbol_table.ml + stdlib.ml]
+    E --> F[Multi-Program Analysis<br/>multi_program_analyzer.ml]
+    F --> G[Type Checking<br/>type_checker.ml]
+    G --> H[Safety Analysis<br/>safety_checker.ml]
+    H --> I[IR Generation + Optimization<br/>ir_generator.ml / multi_program_ir_optimizer.ml]
+    I --> J[Ring Buffer / Tail Call Analysis]
+    J --> K[eBPF C Output<br/>ebpf_c_codegen.ml]
+    J --> L[Userspace C Output<br/>userspace_codegen.ml]
+    J --> M[Kernel Module Output<br/>kernel_module_codegen.ml<br/>only if @kfunc exists]

@@ -1,0 +1,24 @@
+%%{init: {
+  "theme":"base",
+  "themeVariables":{
+    "background":"transparent",
+    "lineColor":"#000000",
+    "fontFamily": "Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji'"
+  }
+}}%%
+flowchart LR
+    A[KernelScript 源码] --> B[前端]
+    B --> B1[解析 AST]
+    B --> B2[类型检查]
+    B --> B3[安全检查]
+    B --> C[中端]
+    C --> C1[统一 IR]
+    C --> C2[多程序分析]
+    C --> C3[资源规划]
+    C --> D[后端]
+    D --> D1[eBPF C]
+    D --> D2[Userspace C]
+    D --> D3[Kernel Module C]
+
+classDef nodeStyle fill:#ffffff,stroke:#000000,stroke-width:2px;
+class A,B,B1,B2,B3,C,C1,C2,C3,D,D1,D2,D3 nodeStyle
