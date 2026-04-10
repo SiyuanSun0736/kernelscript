@@ -837,7 +837,7 @@ let test_selective_struct_inclusion_in_ebpf () =
 let test_struct_ops_compilation_completeness () =
   let program = {|
     @struct_ops("tcp_congestion_ops")
-    impl MinimalCongestion {
+  impl minimal_congestion_control {
         fn ssthresh(sk: *u8) -> u32 {
             return 16
         }
@@ -845,8 +845,7 @@ let test_struct_ops_compilation_completeness () =
         fn cong_avoid(sk: *u8, ack: u32, acked: u32) -> void {
             // Implementation
         }
-        
-        name: "minimal_cc",
+
         owner: null,
     }
     
@@ -855,7 +854,7 @@ let test_struct_ops_compilation_completeness () =
     }
     
     fn main() -> i32 {
-        var result = register(MinimalCongestion)
+      var result = register(minimal_congestion_control)
         return result
     }
   |} in
@@ -875,15 +874,46 @@ let test_struct_ops_compilation_completeness () =
   
   (* Check that the struct_ops instance can be instantiated (key thing that was failing) *)
   check bool "Contains struct_ops instance instantiation" true
-    (contains_substr c_code "MinimalCongestion" && contains_substr c_code "struct tcp_congestion_ops");
+    (contains_substr c_code "minimal_congestion_control" && contains_substr c_code "struct tcp_congestion_ops");
   
   (* Verify SEC annotations are present *)
   check bool "Contains .struct_ops section" true
     (contains_substr c_code "SEC(\".struct_ops\")");
+
+  (* Verify the compiler synthesizes a safe default name when omitted *)
+  check bool "Contains synthesized tcp_congestion_ops name" true
+    (contains_substr c_code ".name = \"minimal_cc\"");
   
   (* Verify individual function SEC annotations *)
   check bool "Contains struct_ops function sections" true
     (contains_substr c_code "SEC(\"struct_ops/")
+
+(** Test struct_ops internal calls stay as direct calls instead of tail calls *)
+let test_struct_ops_internal_calls_are_direct () =
+  let program = {|
+    @struct_ops("tcp_congestion_ops")
+    impl minimal_congestion_control {
+        fn ssthresh(sk: *u8) -> u32 {
+            return 16
+        }
+
+        fn undo_cwnd(sk: *u8) -> u32 {
+            return ssthresh(sk)
+        }
+    }
+  |} in
+
+  let ast = Parse.parse_string program in
+  let ast_with_structs = ast @ Test_utils.StructOps.builtin_ast in
+  let symbol_table = Symbol_table.build_symbol_table ast_with_structs in
+  let (typed_ast, _) = Type_checker.type_check_and_annotate_ast ast_with_structs in
+  let ir = Ir_generator.generate_ir typed_ast symbol_table "test" in
+  let (c_code, _) = Ebpf_c_codegen.compile_multi_to_c_with_analysis ir in
+
+  check bool "struct_ops direct call emitted" true
+    (contains_substr c_code "ssthresh(sk)");
+  check bool "struct_ops tail call not emitted" false
+    (contains_substr c_code "bpf_tail_call(ctx, &prog_array, 0)")
 
 (** NEW: Test struct inclusion logic with mixed struct types *)
 let test_mixed_struct_types_inclusion () =
@@ -1247,6 +1277,7 @@ let tests = [
   (* NEW: Regression tests for struct inclusion bugs *)
   "selective struct inclusion in eBPF", `Quick, test_selective_struct_inclusion_in_ebpf;
   "struct_ops compilation completeness", `Quick, test_struct_ops_compilation_completeness;
+  "struct_ops internal direct calls", `Quick, test_struct_ops_internal_calls_are_direct;
   "mixed struct types inclusion", `Quick, test_mixed_struct_types_inclusion;
   "malformed struct_ops attribute", `Quick, test_malformed_struct_ops_attribute;
   "register() with non-struct", `Quick, test_register_with_non_struct;
