@@ -331,7 +331,49 @@ let test_userspace_struct_ops_codegen () =
   
   (* Check that struct_ops setup is included *)
   check bool "Contains struct_ops setup" true
-    (try ignore (Str.search_forward (Str.regexp "MyTcpCong") userspace_code 0); true with Not_found -> false)
+    (try ignore (Str.search_forward (Str.regexp "MyTcpCong") userspace_code 0); true with Not_found -> false);
+
+  check bool "Contains memlock helper for struct_ops" true
+    (contains_substr userspace_code "static int bump_memlock_rlimit(void)");
+
+  check bool "Contains privilege helper for struct_ops" true
+    (contains_substr userspace_code "static int ensure_struct_ops_privileges(void)");
+
+  check bool "Main calls struct_ops runtime checks" true
+    (contains_substr userspace_code "if (bump_memlock_rlimit() < 0)" &&
+     contains_substr userspace_code "if (ensure_struct_ops_privileges() < 0)");
+
+  check bool "Contains struct_ops link global" true
+    (contains_substr userspace_code "static struct bpf_link *MyTcpCong_link = NULL;");
+
+  check bool "Contains struct_ops cleanup helper" true
+    (contains_substr userspace_code "static void cleanup_test(void)");
+
+  check bool "Contains wait helper for struct_ops" true
+    (contains_substr userspace_code "static void wait_for_unregister_request(void)");
+
+  check bool "Contains real attach helper for struct_ops" true
+    (contains_substr userspace_code "int attach_struct_ops_MyTcpCong(void)" &&
+     contains_substr userspace_code "MyTcpCong_link = bpf_map__attach_struct_ops(map);");
+
+  check bool "Contains real detach helper for struct_ops" true
+    (contains_substr userspace_code "int detach_struct_ops_MyTcpCong(void)" &&
+     contains_substr userspace_code "bpf_link__destroy(MyTcpCong_link);");
+
+  check bool "register() uses attach helper" true
+    (contains_substr userspace_code "attach_struct_ops_MyTcpCong()");
+
+  check bool "Struct_ops load failure includes EPERM hint" true
+    (contains_substr userspace_code "The kernel rejected BPF loading with EPERM. Make sure you run as root and the kernel supports struct_ops.");
+
+  check bool "Main waits for unregister request" true
+    (contains_substr userspace_code "wait_for_unregister_request();");
+
+  check bool "Main detaches struct_ops before exit" true
+    (contains_substr userspace_code "detach_struct_ops_MyTcpCong();");
+
+  check bool "Main registers struct_ops cleanup" true
+    (contains_substr userspace_code "atexit(cleanup_test);")
 
 (** Test that malformed struct_ops attributes are parsed but should be caught *)
 let test_malformed_struct_ops_attribute () =
@@ -913,7 +955,7 @@ let test_struct_ops_internal_calls_are_direct () =
   check bool "struct_ops direct call emitted" true
     (contains_substr c_code "ssthresh(sk)");
   check bool "struct_ops tail call not emitted" false
-    (contains_substr c_code "bpf_tail_call(ctx, &prog_array, 0)")
+    (contains_substr c_code "bpf_tail_call(ctx, &prog_array")
 
 (** NEW: Test struct inclusion logic with mixed struct types *)
 let test_mixed_struct_types_inclusion () =

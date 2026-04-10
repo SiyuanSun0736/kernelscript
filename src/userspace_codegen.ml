@@ -2223,24 +2223,11 @@ let rec generate_c_instruction_from_ir ctx instruction =
              | IRStruct (name, _) -> name
              | _ -> failwith "struct_ops register() argument must be an impl block instance")
       in
-      (* Generate struct_ops registration code *)
-      sprintf {|({
-    if (!obj) {
-        fprintf(stderr, "eBPF skeleton not loaded for struct_ops registration\n");
-        %s = -1;
-    } else {
-        struct bpf_map *map = bpf_object__find_map_by_name(obj->obj, "%s");
-        if (!map) {
-            fprintf(stderr, "Failed to find struct_ops map '%s'\n");
-            %s = -1;
-        } else {
-            struct bpf_link *link = bpf_map__attach_struct_ops(map);
-            %s = (link != NULL) ? 0 : -1;
-            if (link) bpf_link__destroy(link);
-        }
-    }
-    %s;
-});|} result_str instance_name instance_name result_str result_str result_str
+        (* Generate struct_ops registration code via the generated helper to keep the link alive *)
+        sprintf {|({
+      %s = attach_struct_ops_%s();
+      %s;
+    });|} result_str instance_name result_str
 
 (** Generate C struct from IR struct definition *)
 let generate_c_struct_from_ir ir_struct =
@@ -2354,6 +2341,123 @@ let collect_function_usage_from_ir_function ?(global_variables = []) ir_func =
     track_usage_in_instructions ctx block.instructions
   ) ir_func.basic_blocks;
   ctx.function_usage
+
+type struct_ops_main_registration = {
+  result_value: ir_value;
+  result_name: string;
+  instance_name: string;
+}
+
+let ir_value_variable_name ir_value =
+  match ir_value.value_desc with
+  | IRVariable name | IRTempVariable name -> Some name
+  | _ -> None
+
+let struct_ops_instance_name ir_value =
+  match ir_value.value_desc with
+  | IRVariable name -> Some name
+  | IRTempVariable name -> Some name
+  | _ ->
+      (match ir_value.val_type with
+       | IRStruct (name, _) -> Some name
+       | _ -> None)
+
+let find_struct_ops_main_registration ir_func =
+  let registrations = List.fold_left (fun acc block ->
+    List.fold_left (fun inner_acc instr ->
+      match instr.instr_desc with
+      | IRStructOpsRegister (result_val, struct_ops_val) ->
+          (match ir_value_variable_name result_val, struct_ops_instance_name struct_ops_val with
+           | Some result_name, Some instance_name ->
+               { result_value = result_val; result_name; instance_name } :: inner_acc
+           | _ -> inner_acc)
+      | _ -> inner_acc
+    ) acc block.instructions
+  ) [] ir_func.basic_blocks in
+  match List.rev ir_func.basic_blocks, registrations with
+  | last_block :: _, [registration] ->
+      (match List.rev last_block.instructions with
+       | { instr_desc = IRReturn (Some return_val); _ } :: _ ->
+           if ir_value_variable_name return_val = Some registration.result_name then
+             Some registration
+           else
+             None
+       | _ -> None)
+  | _ -> None
+
+let is_c_identifier value =
+  let is_ident_start = function
+    | 'a' .. 'z' | 'A' .. 'Z' | '_' -> true
+    | _ -> false
+  in
+  let is_ident_char = function
+    | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' -> true
+    | _ -> false
+  in
+  String.length value > 0
+  && is_ident_start value.[0]
+  &&
+  let rec check index =
+    if index >= String.length value then true
+    else if is_ident_char value.[index] then check (index + 1)
+    else false
+  in
+  check 1
+
+let extract_terminal_return_identifier body_c =
+  let lines = Array.of_list (String.split_on_char '\n' body_c) in
+  let rec drop_leading_blank_lines = function
+    | line :: rest when String.trim line = "" -> drop_leading_blank_lines rest
+    | remaining -> remaining
+  in
+  let rec find_last_nonempty index =
+    if index < 0 then None
+    else if String.trim lines.(index) = "" then find_last_nonempty (index - 1)
+    else Some index
+  in
+  match find_last_nonempty (Array.length lines - 1) with
+  | None -> None
+  | Some index ->
+      let trimmed_line = String.trim lines.(index) in
+      let prefix = "return " in
+      if String.length trimmed_line > String.length prefix
+         && String.sub trimmed_line 0 (String.length prefix) = prefix
+         && trimmed_line.[String.length trimmed_line - 1] = ';' then
+        let expr = String.sub trimmed_line (String.length prefix) (String.length trimmed_line - String.length prefix - 1) |> String.trim in
+        if is_c_identifier expr then
+          let kept_lines =
+            Array.to_list (Array.sub lines 0 index)
+            |> List.rev
+            |> drop_leading_blank_lines
+            |> List.rev
+          in
+          Some (String.concat "\n" kept_lines, expr)
+        else
+          None
+      else
+        None
+
+let extract_attach_result_identifier body_c instance_name =
+  let attach_call = sprintf "attach_struct_ops_%s();" instance_name in
+  let extract_identifier_from_lhs line =
+    match String.index_opt line '=' with
+    | None -> None
+    | Some eq_index ->
+        let lhs = String.sub line 0 eq_index |> String.trim in
+        if is_c_identifier lhs then Some lhs else None
+  in
+  String.split_on_char '\n' body_c
+  |> List.find_map (fun line ->
+         if String.contains line '=' && String.contains line 'a' && String.trim line <> "" then
+           let trimmed_line = String.trim line in
+           if String.length trimmed_line >= String.length attach_call
+              && String.contains trimmed_line '='
+              && String.ends_with ~suffix:attach_call trimmed_line then
+             extract_identifier_from_lhs trimmed_line
+           else
+             None
+         else
+           None)
 
 (** Generate config initialization from declaration defaults *)
 let generate_config_initialization (config_decl : Ast.config_declaration) =
@@ -2568,6 +2672,13 @@ let generate_c_function_from_ir ?(global_variables = []) ?(base_name = "") ?(con
   let adjusted_return_type = if ir_func.func_name = "main" then "int" else return_type_str in
   
   if ir_func.func_name = "main" then
+    let has_struct_ops_instances = match ir_multi_prog with
+      | Some multi_prog -> Ir.get_struct_ops_instances multi_prog <> []
+      | None -> false
+    in
+    let struct_ops_main_registration =
+      if has_struct_ops_instances then find_struct_ops_main_registration ir_func else None
+    in
     let args_parsing_code = 
       if List.length ir_func.parameters > 0 then
         (* Generate argument parsing for struct parameter *)
@@ -2593,9 +2704,13 @@ let generate_c_function_from_ir ?(global_variables = []) ?(base_name = "") ?(con
         obj = %s_ebpf__open_and_load();
         if (!obj) {
             fprintf(stderr, "Failed to open and load eBPF skeleton\n");
-            return 1;
+%s            return 1;
         }
     }|} base_name
+        (if has_struct_ops_instances then
+           "            if (errno == EPERM) {\n                fprintf(stderr, \"The kernel rejected BPF loading with EPERM. Make sure you run as root and the kernel supports struct_ops.\\n\");\n            }\n"
+         else
+           "")
     else ""
     in
     
@@ -2605,6 +2720,12 @@ let generate_c_function_from_ir ?(global_variables = []) ?(base_name = "") ?(con
     let auto_init_call = if needs_auto_init then
       "    \n    // Auto-initialize BPF maps\n    atexit(cleanup_bpf_maps);\n    if (init_bpf_maps() < 0) {\n        return 1;\n    }"
     else "" in
+
+    let struct_ops_init_code = match ir_multi_prog with
+      | Some _ when has_struct_ops_instances ->
+          sprintf "    if (bump_memlock_rlimit() < 0) {\n        return 1;\n    }\n\n    if (ensure_struct_ops_privileges() < 0) {\n        return 1;\n    }\n\n    atexit(cleanup_%s);" base_name
+      | _ -> ""
+    in
     
     (* Include setup code when object is loaded in main() *)
     let pinned_globals_vars = List.filter (fun gv -> gv.is_pinned) global_variables in
@@ -2661,6 +2782,7 @@ let generate_c_function_from_ir ?(global_variables = []) ?(base_name = "") ?(con
     
     (* Combine skeleton loading with other initialization *)
     let initialization_code = String.concat "\n" (List.filter (fun s -> s <> "") [
+      struct_ops_init_code;
       skeleton_loading_code;
       setup_call;
       auto_init_call;
@@ -2668,6 +2790,65 @@ let generate_c_function_from_ir ?(global_variables = []) ?(base_name = "") ?(con
       error_handling_notice;
     ]) in
     
+    let body_parts = List.mapi (fun index block ->
+      let label_part = if block.label <> "entry" then [sprintf "%s:" block.label] else [] in
+      let instructions =
+        if index = List.length ir_func.basic_blocks - 1 then
+          match struct_ops_main_registration, List.rev block.instructions with
+          | Some registration, { instr_desc = IRReturn (Some return_val); _ } :: rest_rev
+            when ir_value_variable_name return_val = Some registration.result_name ->
+              List.rev rest_rev
+          | _ -> block.instructions
+        else
+          block.instructions
+      in
+      let instr_parts = List.map (generate_c_instruction_from_ir ctx) instructions in
+      let combined_parts = label_part @ instr_parts in
+      String.concat "\n    " combined_parts
+    ) ir_func.basic_blocks in
+
+    let body_c = String.concat "\n    " body_parts in
+    let body_c =
+      let lifecycle_info = match struct_ops_main_registration with
+      | Some registration ->
+            let result_name = generate_c_value_from_ir ctx registration.result_value in
+            Some (body_c, result_name, registration.instance_name, result_name)
+      | None ->
+        (match ir_multi_prog with
+         | Some multi_prog ->
+           (match Ir.get_struct_ops_instances multi_prog with
+            | [instance] ->
+              (match extract_terminal_return_identifier body_c with
+                       | Some (body_prefix, result_name) ->
+                           let attach_result_name = match extract_attach_result_identifier body_prefix instance.ir_instance_name with
+                             | Some name -> name
+                             | None -> result_name
+                           in
+                           Some (body_prefix, result_name, instance.ir_instance_name, attach_result_name)
+               | None -> None)
+            | _ -> None)
+         | None -> None)
+      in
+      match lifecycle_info with
+      | Some (body_prefix, result_str, instance_name, attach_status_str) ->
+          let lifecycle_code = sprintf {|if (%s != 0) {
+        %s = %s;
+        return %s;
+    }
+
+    wait_for_unregister_request();
+
+    %s = detach_struct_ops_%s();
+    if (%s != 0) {
+        return %s;
+    }
+
+    %s = 0;
+    return %s;|} attach_status_str result_str attach_status_str result_str result_str instance_name result_str result_str result_str result_str in
+        if body_prefix = "" then lifecycle_code else body_prefix ^ "\n    \n    " ^ lifecycle_code
+      | None -> body_c
+    in
+
     (* Generate ONLY what the user explicitly wrote with skeleton loading at the beginning *)
     sprintf {|%s %s(%s) {
 %s%s%s
@@ -2707,10 +2888,137 @@ let generate_struct_ops_attach_functions ir_multi_program =
   else
     let attach_functions = List.map (fun struct_ops_inst ->
       let instance_name = struct_ops_inst.ir_instance_name in
-      sprintf "int attach_struct_ops_%s(void) { return 0; }\nint detach_struct_ops_%s(void) { return 0; }" 
+      sprintf {|int attach_struct_ops_%s(void) {
+    struct bpf_map *map;
+
+    if (!obj) {
+        fprintf(stderr, "eBPF skeleton not loaded for struct_ops registration\n");
+        return -1;
+    }
+
+    if (%s_link) {
+        return 0;
+    }
+
+    map = bpf_object__find_map_by_name(obj->obj, "%s");
+    if (!map) {
+        fprintf(stderr, "Failed to find struct_ops map '%s'\n");
+        return -1;
+    }
+
+    %s_link = bpf_map__attach_struct_ops(map);
+    if (!%s_link) {
+        fprintf(stderr, "Failed to register struct_ops instance '%s': %%s\n", strerror(errno));
+        return -1;
+    }
+
+    printf("Registered struct_ops instance: %s\n");
+    return 0;
+}
+
+int detach_struct_ops_%s(void) {
+    if (!%s_link) {
+        return 0;
+    }
+
+    bpf_link__destroy(%s_link);
+    %s_link = NULL;
+    printf("Detached struct_ops instance: %s\n");
+    return 0;
+}|}
+        instance_name
+        instance_name
         instance_name instance_name
+        instance_name instance_name instance_name
+        instance_name
+        instance_name
+        instance_name
+        instance_name
+        instance_name
+        instance_name
     ) (Ir.get_struct_ops_instances ir_multi_program) in
     String.concat "\n" attach_functions
+
+let generate_struct_ops_runtime_helpers base_name ir_multi_program =
+  let struct_ops_instances = Ir.get_struct_ops_instances ir_multi_program in
+  if struct_ops_instances = [] then
+    ""
+  else
+    let link_declarations =
+      struct_ops_instances
+      |> List.map (fun struct_ops_inst ->
+           sprintf "static struct bpf_link *%s_link = NULL;" struct_ops_inst.ir_instance_name)
+      |> String.concat "\n"
+    in
+    let cleanup_lines =
+      struct_ops_instances
+      |> List.map (fun struct_ops_inst ->
+           let instance_name = struct_ops_inst.ir_instance_name in
+           sprintf {|    if (%s_link) {
+        bpf_link__destroy(%s_link);
+        %s_link = NULL;
+    }|} instance_name instance_name instance_name)
+      |> String.concat "\n\n"
+    in
+    sprintf {|%s
+
+static int bump_memlock_rlimit(void) {
+    struct rlimit rlim = {
+        .rlim_cur = RLIM_INFINITY,
+        .rlim_max = RLIM_INFINITY,
+    };
+
+    if (setrlimit(RLIMIT_MEMLOCK, &rlim) == 0) {
+        return 0;
+    }
+
+    if (errno == EPERM) {
+        fprintf(stderr, "Warning: failed to raise RLIMIT_MEMLOCK: %%s\n", strerror(errno));
+        fprintf(stderr, "Continuing anyway because newer kernels may use memcg accounting instead of memlock.\n");
+        return 0;
+    }
+
+    fprintf(stderr, "Failed to raise RLIMIT_MEMLOCK: %%s\n", strerror(errno));
+    return -1;
+}
+
+static int ensure_struct_ops_privileges(void) {
+    if (geteuid() == 0) {
+        return 0;
+    }
+
+    fprintf(stderr, "Warning: struct_ops loading typically requires root privileges or CAP_BPF/CAP_SYS_ADMIN.\n");
+    fprintf(stderr, "Continuing anyway; loading may still succeed if this process has the required capabilities.\n");
+    fprintf(stderr, "If it fails with a permission error, try: sudo ./%s\n");
+    return 0;
+}
+
+static void cleanup_%s(void) {
+%s
+
+    if (obj) {
+        %s_ebpf__destroy(obj);
+        obj = NULL;
+    }
+}
+
+static void wait_for_unregister_request(void) {
+    int ch;
+
+    printf("struct_ops instance is active in the kernel.\n");
+    printf("Inspect it from another shell with:\n");
+    printf("  sudo bpftool struct_ops show\n");
+    printf("Press Enter to unregister it and exit.\n");
+
+    do {
+        ch = getchar();
+    } while (ch != '\n' && ch != EOF);
+}|}
+      link_declarations
+      base_name
+      base_name
+      cleanup_lines
+      base_name
 
 (** Generate command line argument parsing for struct parameter *)
 let generate_getopt_parsing (struct_name : string) (param_name : string) (struct_fields : (string * ir_type) list) =
@@ -4237,6 +4545,8 @@ static void handle_signal(int sig) {
 |}
   else "" in
 
+  let struct_ops_runtime_helpers = generate_struct_ops_runtime_helpers base_name ir_multi_prog in
+
   (* Generate struct_ops attach functions *)
   let struct_ops_attach_functions = generate_struct_ops_attach_functions ir_multi_prog in
 
@@ -4270,7 +4580,7 @@ static void handle_signal(int sig) {
 %s
 
 %s
-|} includes string_typedefs unified_declarations string_helpers daemon_globals "" structs_with_pinned skeleton_code all_fd_declarations map_operation_functions ringbuf_handlers ringbuf_dispatch_functions auto_bpf_init_code getopt_parsing_code bpf_helper_functions struct_ops_attach_functions functions
+|} includes string_typedefs unified_declarations string_helpers daemon_globals "" structs_with_pinned skeleton_code all_fd_declarations map_operation_functions ringbuf_handlers ringbuf_dispatch_functions auto_bpf_init_code getopt_parsing_code bpf_helper_functions (struct_ops_runtime_helpers ^ (if struct_ops_runtime_helpers <> "" && struct_ops_attach_functions <> "" then "\n\n" else "") ^ struct_ops_attach_functions) functions
 
 (** Generate userspace C code from IR multi-program *)
 let generate_userspace_code_from_ir ?(config_declarations = []) ?(tail_call_analysis = {Tail_call_analyzer.dependencies = []; prog_array_size = 0; index_mapping = Hashtbl.create 16; errors = []}) ?(kfunc_dependencies = {kfunc_definitions = []; private_functions = []; program_dependencies = []; module_name = ""}) ?(resolved_imports = []) (ir_multi_prog : ir_multi_program) ?(output_dir = ".") source_filename =
