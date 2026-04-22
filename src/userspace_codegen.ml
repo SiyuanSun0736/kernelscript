@@ -382,6 +382,7 @@ type kfunc_dependency_info = {
 type function_usage = {
   mutable uses_load: bool;
   mutable uses_attach: bool;
+  mutable uses_attach_perf: bool;
   mutable uses_detach: bool;
   mutable uses_map_operations: bool;
   mutable uses_daemon: bool;
@@ -393,6 +394,7 @@ type function_usage = {
 let create_function_usage () = {
   uses_load = false;
   uses_attach = false;
+  uses_attach_perf = false;
   uses_detach = false;
   uses_map_operations = false;
   uses_daemon = false;
@@ -470,7 +472,7 @@ let extract_function_calls_from_ir_function ir_func =
 let get_program_type_from_attributes attr_list =
   List.fold_left (fun acc attr ->
     match attr with
-    | Ast.SimpleAttribute attr_name when List.mem attr_name ["xdp"; "tc"; "kprobe"; "tracepoint"] ->
+    | Ast.SimpleAttribute attr_name when List.mem attr_name ["xdp"; "tc"; "kprobe"; "tracepoint"; "perf_event"] ->
         Some attr_name
     | _ -> acc
   ) None attr_list
@@ -702,7 +704,13 @@ let track_function_usage ctx instr =
        | DirectCall func_name ->
            (match func_name with
             | "load" -> ctx.function_usage.uses_load <- true
-            | "attach" -> ctx.function_usage.uses_attach <- true
+            | "attach" -> 
+                ctx.function_usage.uses_attach <- true;
+                (* If called with (handle, perf_event_attr), also needs perf infrastructure *)
+                (match args with
+                 | [_; attr_val] when (match attr_val.val_type with IRStruct ("perf_event_attr", _) -> true | _ -> false) ->
+                     ctx.function_usage.uses_attach_perf <- true
+                 | _ -> ())
             | "detach" -> ctx.function_usage.uses_detach <- true
             | "daemon" -> ctx.function_usage.uses_daemon <- true
             | "exec" -> 
@@ -1889,20 +1897,40 @@ let rec generate_c_instruction_from_ir ctx instruction =
              | "attach" ->
                  (* Special handling for attach: now takes program handle (not program name) *)
                  ctx.function_usage.uses_attach <- true;
-                 (match c_args with
-                  | [program_handle; target; flags] ->
-                      (* KernelScript uses "category/name" format for tracepoints, convert to libbpf "category:name" format *)
-                      let normalized_target = 
-                        if String.contains target '/' then
-                          (* Convert KernelScript "sched/sched_switch" to libbpf "sched:sched_switch" *)
-                          String.map (function '/' -> ':' | c -> c) target
-                        else
-                          (* For non-tracepoint targets (XDP interfaces, kprobe functions, raw tracepoints), use as-is *)
-                          target
-                      in
-                      (* Use the program handle variable directly instead of extracting program name *)
-                      ("attach_bpf_program_by_fd", [program_handle; normalized_target; flags])
-                  | _ -> failwith "attach expects exactly three arguments")
+                 (* Detect perf_event form: attach(handle, perf_event_attr) *)
+                 (match args with
+                  | [_; attr_val] when (match attr_val.val_type with IRStruct ("perf_event_attr", _) -> true | _ -> false) ->
+                      (* Perf event form: open perf fd via ks_open_perf_event then call attach_bpf_program_by_fd.
+                         We use the sentinel "__PERF_RAW_EMIT__" so the basic_call site emits the raw
+                         multi-statement code verbatim instead of wrapping it in a function call. *)
+                      ctx.function_usage.uses_attach_perf <- true;
+                      ctx.function_usage.uses_load <- true;
+                      (match c_args with
+                       | [program_handle; attr_arg] ->
+                           let pfd_var  = fresh_temp_var ctx "__ks_pfd"  in
+                           let pstr_var = fresh_temp_var ctx "__ks_pstr" in
+                           let raw_code = sprintf
+                             "int %s = ks_open_perf_event(%s);\n    char %s[32];\n    snprintf(%s, sizeof(%s), \"%%d\", %s);\n    attach_bpf_program_by_fd(%s, %s, 0)"
+                             pfd_var attr_arg pstr_var pstr_var pstr_var pfd_var program_handle pstr_var
+                           in
+                           ("__PERF_RAW_EMIT__", [raw_code])
+                       | _ -> failwith "attach with perf_event_attr expects exactly two arguments")
+                  | _ ->
+                      (* Standard form: attach(handle, target, flags) *)
+                      (match c_args with
+                       | [program_handle; target; flags] ->
+                           (* KernelScript uses "category/name" format for tracepoints, convert to libbpf "category:name" format *)
+                           let normalized_target = 
+                             if String.contains target '/' then
+                               (* Convert KernelScript "sched/sched_switch" to libbpf "sched:sched_switch" *)
+                               String.map (function '/' -> ':' | c -> c) target
+                             else
+                               (* For non-tracepoint targets (XDP interfaces, kprobe functions, raw tracepoints), use as-is *)
+                               target
+                           in
+                           (* Use the program handle variable directly instead of extracting program name *)
+                           ("attach_bpf_program_by_fd", [program_handle; normalized_target; flags])
+                       | _ -> failwith "attach expects exactly three arguments (handle, target, flags)"))
              | "detach" ->
                  (* Special handling for detach: takes only program handle *)
                  ctx.function_usage.uses_detach <- true;
@@ -1953,7 +1981,12 @@ let rec generate_c_instruction_from_ir ctx instruction =
       
       let basic_call = (match ret_opt with
        | Some result -> sprintf "%s = %s(%s);" (generate_c_value_from_ir ctx result) actual_name args_str
-       | None -> sprintf "%s(%s);" actual_name args_str) in
+       | None ->
+           (* Special case: perf_event_attr attach emits pre-built multi-statement code *)
+           if actual_name = "__PERF_RAW_EMIT__" then
+             (match translated_args with [raw] -> raw ^ ";" | _ -> failwith "__PERF_RAW_EMIT__ expects exactly one arg")
+           else
+             sprintf "%s(%s);" actual_name args_str) in
       
       (* Add error checking for load in main function *)
       if ctx.is_main && (match target with DirectCall "load" -> true | _ -> false) then
@@ -3449,6 +3482,7 @@ let generate_complete_userspace_program_from_ir ?(config_declarations = []) ?(ta
     {
       uses_load = acc_usage.uses_load || func_usage.uses_load;
       uses_attach = acc_usage.uses_attach || func_usage.uses_attach;
+      uses_attach_perf = acc_usage.uses_attach_perf || func_usage.uses_attach_perf;
       uses_detach = acc_usage.uses_detach || func_usage.uses_detach;
       uses_map_operations = acc_usage.uses_map_operations || func_usage.uses_map_operations;
       uses_daemon = acc_usage.uses_daemon || func_usage.uses_daemon;
@@ -3486,7 +3520,10 @@ let generate_complete_userspace_program_from_ir ?(config_declarations = []) ?(ta
   
   let uses_bpf_functions = all_usage.uses_load || all_usage.uses_attach || all_usage.uses_detach in
   let base_includes = generate_headers_for_maps ~uses_bpf_functions maps_for_headers in
-  let additional_includes = {|#include <stdbool.h>
+  let bpf_attach_includes = if uses_bpf_functions then
+    "#include <sys/ioctl.h>\n#include <linux/perf_event.h>\n"
+  else "" in
+  let additional_includes = bpf_attach_includes ^ {|#include <stdbool.h>
 #include <stdint.h>
 #include <inttypes.h>
 #include <getopt.h>
@@ -3520,8 +3557,46 @@ let generate_complete_userspace_program_from_ir ?(config_declarations = []) ?(ta
   
   (* Generate bridge code for imported KernelScript and Python modules *)
   let bridge_code = generate_mixed_bridge_code resolved_imports userspace_prog.userspace_functions in
+
+  (* Conditional perf_event type definitions *)
+  let perf_event_defs = if all_usage.uses_attach_perf then {|
+#include <linux/perf_event.h>
+#include <sys/syscall.h>
+#include <sys/ioctl.h>
+#include <dirent.h>
+
+/* KernelScript perf_event types */
+typedef enum {
+    cpu_cycles = 0,
+    instructions = 1,
+    cache_references = 2,
+    cache_misses = 3,
+    branch_instructions = 4,
+    branch_misses = 5,
+    page_faults = 6,
+    context_switches = 7,
+    cpu_migrations = 8
+} perf_counter;
+
+/* ks_perf_event_attr wraps the BTF-derived struct perf_event_attr.
+ * The inner 'attr' field holds the actual kernel perf_event_attr (from linux/perf_event.h).
+ * The remaining fields are KernelScript extensions passed to perf_event_open separately. */
+typedef struct {
+    struct perf_event_attr attr;  /* kernel perf event attributes (BTF-derived type) */
+    int32_t counter;              /* KernelScript perf_counter enum value */
+    int32_t pid;                  /* process ID (-1 for all processes) */
+    int32_t cpu;                  /* CPU number (-1 for any CPU) */
+    uint64_t period;              /* sampling period (0 = default 1000000) */
+    uint32_t wakeup;              /* wakeup after N events (0 = default 1) */
+    bool inherit;                 /* inherit to child processes */
+    bool exclude_kernel;          /* exclude kernel events */
+    bool exclude_user;            /* exclude user events */
+} ks_perf_event_attr;
+
+|}
+  else "" in
   
-  let includes = base_includes ^ "\n" ^ additional_includes ^ kmodule_loading_code ^ skeleton_include ^ bridge_code in
+  let includes = base_includes ^ "\n" ^ additional_includes ^ kmodule_loading_code ^ skeleton_include ^ bridge_code ^ perf_event_defs in
 
   (* Reset and use the global config names collector *)
   global_config_names := [];
@@ -3714,8 +3789,8 @@ void cleanup_bpf_maps(void) {
     
     let load_function = generate_load_function_with_tail_calls base_name all_usage tail_call_analysis all_setup_code kfunc_dependencies (Ir.get_global_variables ir_multi_prog) in
     
-    (* Global attachment storage (generated only when attach/detach are used) *)
-    let attachment_storage = if all_usage.uses_attach || all_usage.uses_detach then
+    (* Global attachment storage (generated when attach/detach/attach_perf are used) *)
+    let attachment_storage = if all_usage.uses_attach || all_usage.uses_detach || all_usage.uses_attach_perf then
       {|// Global attachment storage for tracking active program attachments
 struct attachment_entry {
     int prog_fd;
@@ -3723,6 +3798,7 @@ struct attachment_entry {
     uint32_t flags;
     struct bpf_link *link;    // For kprobe/tracepoint programs (NULL for XDP)
     int ifindex;              // For XDP programs (0 for kprobe/tracepoint)
+  int perf_fd;              // For perf_event programs (-1 otherwise)
     enum bpf_prog_type type;
     struct attachment_entry *next;
 };
@@ -3763,7 +3839,8 @@ static void remove_attachment(int prog_fd) {
 
 // Helper function to add attachment entry
 static int add_attachment(int prog_fd, const char *target, uint32_t flags, 
-                         struct bpf_link *link, int ifindex, enum bpf_prog_type type) {
+             struct bpf_link *link, int ifindex, int perf_fd,
+             enum bpf_prog_type type) {
     struct attachment_entry *entry = malloc(sizeof(struct attachment_entry));
     if (!entry) {
         fprintf(stderr, "Failed to allocate memory for attachment entry\n");
@@ -3776,6 +3853,7 @@ static int add_attachment(int prog_fd, const char *target, uint32_t flags,
     entry->flags = flags;
     entry->link = link;
     entry->ifindex = ifindex;
+    entry->perf_fd = perf_fd;
     entry->type = type;
     
     pthread_mutex_lock(&attachment_mutex);
@@ -3826,7 +3904,7 @@ static int add_attachment(int prog_fd, const char *target, uint32_t flags,
             }
             
             // Store XDP attachment (no bpf_link for XDP)
-            if (add_attachment(prog_fd, target, flags, NULL, ifindex, BPF_PROG_TYPE_XDP) != 0) {
+            if (add_attachment(prog_fd, target, flags, NULL, ifindex, -1, BPF_PROG_TYPE_XDP) != 0) {
                 // If storage fails, detach and return error
                 bpf_xdp_detach(ifindex, flags, NULL);
                 return -1;
@@ -3841,7 +3919,6 @@ static int add_attachment(int prog_fd, const char *target, uint32_t flags,
             
             // Get the bpf_program struct from the object and file descriptor
             struct bpf_program *prog = NULL;
-            struct bpf_object *obj_iter;
 
             // Find the program object corresponding to this fd
             // We need to get the program from the skeleton object
@@ -3864,14 +3941,15 @@ static int add_attachment(int prog_fd, const char *target, uint32_t flags,
             // BPF_PROG_TYPE_KPROBE programs always use kprobe attachment
             // (these are generated from @probe("target+offset"))
             struct bpf_link *link = bpf_program__attach_kprobe(prog, false, target);
-            if (!link) {
-                fprintf(stderr, "Failed to attach kprobe to function '%s': %s\n", target, strerror(errno));
+            long link_err = libbpf_get_error(link);
+            if (link_err) {
+              fprintf(stderr, "Failed to attach kprobe to function '%s': %s\n", target, strerror((int)-link_err));
                 return -1;
             }
             printf("Kprobe attached to function: %s\n", target);
             
             // Store probe attachment for later cleanup
-            if (add_attachment(prog_fd, target, flags, link, 0, BPF_PROG_TYPE_KPROBE) != 0) {
+            if (add_attachment(prog_fd, target, flags, link, 0, -1, BPF_PROG_TYPE_KPROBE) != 0) {
                 // If storage fails, destroy link and return error
                 bpf_link__destroy(link);
                 return -1;
@@ -3905,15 +3983,16 @@ static int add_attachment(int prog_fd, const char *target, uint32_t flags,
 
             // For fentry/fexit programs, use bpf_program__attach_trace
             struct bpf_link *link = bpf_program__attach_trace(prog);
-            if (!link) {
-                fprintf(stderr, "Failed to attach fentry/fexit program to function '%s': %s\n", target, strerror(errno));
+            long link_err = libbpf_get_error(link);
+            if (link_err) {
+              fprintf(stderr, "Failed to attach fentry/fexit program to function '%s': %s\n", target, strerror((int)-link_err));
                 return -1;
             }
             
             printf("Fentry/fexit program attached to function: %s\n", target);
             
             // Store tracing attachment for later cleanup
-            if (add_attachment(prog_fd, target, flags, link, 0, BPF_PROG_TYPE_TRACING) != 0) {
+            if (add_attachment(prog_fd, target, flags, link, 0, -1, BPF_PROG_TYPE_TRACING) != 0) {
                 // If storage fails, destroy link and return error
                 bpf_link__destroy(link);
                 return -1;
@@ -3965,13 +4044,14 @@ static int add_attachment(int prog_fd, const char *target, uint32_t flags,
 
             // Use libbpf's high-level tracepoint attachment API with category and event name
             struct bpf_link *link = bpf_program__attach_tracepoint(prog, category, event_name);
-            if (!link) {
-                fprintf(stderr, "Failed to attach tracepoint to '%s:%s': %s\n", category, event_name, strerror(errno));
+            long link_err = libbpf_get_error(link);
+            if (link_err) {
+              fprintf(stderr, "Failed to attach tracepoint to '%s:%s': %s\n", category, event_name, strerror((int)-link_err));
                 return -1;
             }
             
             // Store tracepoint attachment for later cleanup
-            if (add_attachment(prog_fd, target, flags, link, 0, BPF_PROG_TYPE_TRACEPOINT) != 0) {
+            if (add_attachment(prog_fd, target, flags, link, 0, -1, BPF_PROG_TYPE_TRACEPOINT) != 0) {
                 // If storage fails, destroy link and return error
                 bpf_link__destroy(link);
                 return -1;
@@ -4015,13 +4095,14 @@ static int add_attachment(int prog_fd, const char *target, uint32_t flags,
 
             // Use libbpf's TC attachment API
             struct bpf_link *link = bpf_program__attach_tcx(prog, ifindex, &tcx_opts);
-            if (!link) {
-                fprintf(stderr, "Failed to attach TC program to interface '%s': %s\n", target, strerror(errno));
+            long link_err = libbpf_get_error(link);
+            if (link_err) {
+              fprintf(stderr, "Failed to attach TC program to interface '%s': %s\n", target, strerror((int)-link_err));
                 return -1;
             }
             
             // Store TC attachment for later cleanup (flags no longer needed for direction)
-            if (add_attachment(prog_fd, target, 0, link, ifindex, BPF_PROG_TYPE_SCHED_CLS) != 0) {
+            if (add_attachment(prog_fd, target, 0, link, ifindex, -1, BPF_PROG_TYPE_SCHED_CLS) != 0) {
                 // If storage fails, destroy link and return error
                 bpf_link__destroy(link);
                 return -1;
@@ -4031,6 +4112,66 @@ static int add_attachment(int prog_fd, const char *target, uint32_t flags,
             
             return 0;
         }
+        case BPF_PROG_TYPE_PERF_EVENT: {
+            // For perf_event programs, target should be a perf_fd as a decimal string
+            // (the perf_fd is obtained via perf_event_open by ks_open_perf_event, called from attach(prog, attr))
+            char *endptr = NULL;
+            long perf_fd_long = strtol(target, &endptr, 10);
+            if (endptr == target || *endptr != '\0' || perf_fd_long < 0) {
+                fprintf(stderr, "BPF_PROG_TYPE_PERF_EVENT: invalid perf_fd target '%s'. "
+                        "For perf event programs, pass an already-opened perf_fd as a decimal string via "
+                        "attach(handle, target, flags), or use attach(handle, perf_event_attr).\n", target);
+                return -1;
+            }
+            int perf_fd_val = (int)perf_fd_long;
+
+            if (!obj) {
+                fprintf(stderr, "eBPF skeleton not loaded for perf_event attachment\n");
+                return -1;
+            }
+
+            struct bpf_program *prog = NULL;
+            bpf_object__for_each_program(prog, obj->obj) {
+                if (bpf_program__fd(prog) == prog_fd) {
+                    break;
+                }
+            }
+            if (!prog) {
+                fprintf(stderr, "Failed to find bpf_program for fd %d\n", prog_fd);
+                return -1;
+            }
+
+            if (ioctl(perf_fd_val, PERF_EVENT_IOC_RESET, 0) != 0) {
+                fprintf(stderr, "Failed to reset perf event fd %d: %s\n", perf_fd_val, strerror(errno));
+                close(perf_fd_val);
+                return -1;
+            }
+
+            struct bpf_link *link = bpf_program__attach_perf_event(prog, perf_fd_val);
+            long link_err = libbpf_get_error(link);
+            if (link_err) {
+                fprintf(stderr, "Failed to attach perf_event program to perf_fd %d: %s\n", perf_fd_val, strerror((int)-link_err));
+                close(perf_fd_val);
+                return -1;
+            }
+
+            if (ioctl(perf_fd_val, PERF_EVENT_IOC_ENABLE, 0) != 0) {
+                fprintf(stderr, "Failed to enable perf event fd %d: %s\n", perf_fd_val, strerror(errno));
+                bpf_link__destroy(link);
+                close(perf_fd_val);
+                return -1;
+            }
+
+            if (add_attachment(prog_fd, target, flags, link, 0, perf_fd_val, BPF_PROG_TYPE_PERF_EVENT) != 0) {
+                ioctl(perf_fd_val, PERF_EVENT_IOC_DISABLE, 0);
+                bpf_link__destroy(link);
+                close(perf_fd_val);
+                return -1;
+            }
+
+            printf("Perf event program attached to perf_fd: %d\n", perf_fd_val);
+            return 0;
+        }
         default:
             fprintf(stderr, "Unsupported program type for attachment: %d\n", info.type);
             return -1;
@@ -4038,7 +4179,7 @@ static int add_attachment(int prog_fd, const char *target, uint32_t flags,
 }|}
     else "" in
 
-    let detach_function = if all_usage.uses_detach then
+    let detach_function = if all_usage.uses_detach || all_usage.uses_attach_perf then
       {|void detach_bpf_program_by_fd(int prog_fd) {
     if (prog_fd < 0) {
         fprintf(stderr, "Invalid program file descriptor: %d\n", prog_fd);
@@ -4097,6 +4238,21 @@ static int add_attachment(int prog_fd, const char *target, uint32_t flags,
             } else {
                 fprintf(stderr, "Invalid TC program link for program fd %d\n", prog_fd);
             }
+            break;
+        }
+        case BPF_PROG_TYPE_PERF_EVENT: {
+          if (entry->perf_fd >= 0 && ioctl(entry->perf_fd, PERF_EVENT_IOC_DISABLE, 0) != 0) {
+            fprintf(stderr, "Failed to disable perf event: %s\n", strerror(errno));
+          }
+            if (entry->link) {
+                bpf_link__destroy(entry->link);
+            } else {
+                fprintf(stderr, "Invalid perf event link for program fd %d\n", prog_fd);
+            }
+          if (entry->perf_fd >= 0) {
+            close(entry->perf_fd);
+          }
+          printf("Perf event program detached\n");
             break;
         }
         default:
@@ -4219,7 +4375,127 @@ static int ensure_bpf_dir(const char *path) {
 }|}
     else "" in
 
-    let functions_list = List.filter (fun s -> s <> "") [mkdir_helper_function; attachment_storage; load_function; attach_function; detach_function; daemon_function; exec_function] in
+    let perf_attach_function = if all_usage.uses_attach_perf then
+      {|int ks_open_perf_event(ks_perf_event_attr ks_attr) {
+    /* Map KernelScript perf_counter enum to PERF_TYPE_* and PERF_COUNT_* */
+    __u32 perf_type;
+    __u64 perf_config;
+    switch (ks_attr.counter) {
+        case 0: /* cpu_cycles */
+            perf_type = PERF_TYPE_HARDWARE;
+            perf_config = PERF_COUNT_HW_CPU_CYCLES;
+            break;
+        case 1: /* instructions */
+            perf_type = PERF_TYPE_HARDWARE;
+            perf_config = PERF_COUNT_HW_INSTRUCTIONS;
+            break;
+        case 2: /* cache_references */
+            perf_type = PERF_TYPE_HARDWARE;
+            perf_config = PERF_COUNT_HW_CACHE_REFERENCES;
+            break;
+        case 3: /* cache_misses */
+            perf_type = PERF_TYPE_HARDWARE;
+            perf_config = PERF_COUNT_HW_CACHE_MISSES;
+            break;
+        case 4: /* branch_instructions */
+            perf_type = PERF_TYPE_HARDWARE;
+            perf_config = PERF_COUNT_HW_BRANCH_INSTRUCTIONS;
+            break;
+        case 5: /* branch_misses */
+            perf_type = PERF_TYPE_HARDWARE;
+            perf_config = PERF_COUNT_HW_BRANCH_MISSES;
+            break;
+        case 6: /* page_faults */
+            perf_type = PERF_TYPE_SOFTWARE;
+            perf_config = PERF_COUNT_SW_PAGE_FAULTS;
+            break;
+        case 7: /* context_switches */
+            perf_type = PERF_TYPE_SOFTWARE;
+            perf_config = PERF_COUNT_SW_CONTEXT_SWITCHES;
+            break;
+        case 8: /* cpu_migrations */
+            perf_type = PERF_TYPE_SOFTWARE;
+            perf_config = PERF_COUNT_SW_CPU_MIGRATIONS;
+            break;
+        default:
+            fprintf(stderr, "ks_open_perf_event: unknown counter value %d\n", ks_attr.counter);
+            return -1;
+    }
+
+    /* Fill the BTF-derived struct perf_event_attr from KernelScript fields */
+    ks_attr.attr.type = perf_type;
+    ks_attr.attr.size = sizeof(struct perf_event_attr);
+    ks_attr.attr.config = perf_config;
+    ks_attr.attr.sample_type = 0;
+    ks_attr.attr.sample_period = ks_attr.period > 0 ? ks_attr.period : 1000000;
+    ks_attr.attr.wakeup_events = ks_attr.wakeup > 0 ? ks_attr.wakeup : 1;
+    ks_attr.attr.inherit = ks_attr.inherit ? 1 : 0;
+    ks_attr.attr.exclude_kernel = ks_attr.exclude_kernel ? 1 : 0;
+    ks_attr.attr.exclude_user = ks_attr.exclude_user ? 1 : 0;
+    ks_attr.attr.disabled = 1;
+
+    int cpu = ks_attr.cpu;
+    int pid = ks_attr.pid;
+
+    if (pid < -1) {
+        fprintf(stderr, "ks_open_perf_event: invalid pid %d (expected >= -1)\n", pid);
+        return -1;
+    }
+    if (cpu < -1) {
+        fprintf(stderr, "ks_open_perf_event: invalid cpu %d (expected >= -1)\n", cpu);
+        return -1;
+    }
+    if (pid == -1 && cpu == -1) {
+        fprintf(stderr, "ks_open_perf_event: system-wide perf events require an explicit cpu >= 0\n");
+        return -1;
+    }
+
+    int perf_fd = (int)syscall(SYS_perf_event_open, &ks_attr.attr, pid, cpu, -1, PERF_FLAG_FD_CLOEXEC);
+    if (perf_fd < 0) {
+        fprintf(stderr, "ks_open_perf_event: perf_event_open failed: %s\n", strerror(errno));
+        return -1;
+    }
+    return perf_fd;
+}
+
+/* Read the current hardware counter value from an open perf_fd.
+ * Returns the raw 64-bit count, or -1 on error.
+ * The counter accumulates from the last IOC_RESET, so call this
+ * any time after attach to observe real counting progress. */
+int64_t ks_read_perf_count(int perf_fd) {
+    if (perf_fd < 0) {
+        fprintf(stderr, "ks_read_perf_count: invalid perf_fd %d\n", perf_fd);
+        return -1;
+    }
+    uint64_t count = 0;
+    ssize_t n = read(perf_fd, &count, sizeof(count));
+    if (n < 0) {
+        fprintf(stderr, "ks_read_perf_count: read failed on perf_fd %d: %s\n",
+                perf_fd, strerror(errno));
+        return -1;
+    }
+    if (n != sizeof(count)) {
+        fprintf(stderr, "ks_read_perf_count: short read (%zd bytes) on perf_fd %d\n",
+                n, perf_fd);
+        return -1;
+    }
+    return (int64_t)count;
+}
+
+/* Print the current counter value for a named event to stdout.
+ * Convenience wrapper around ks_read_perf_count for quick diagnostics. */
+void ks_print_perf_count(int perf_fd, const char *event_name) {
+    int64_t count = ks_read_perf_count(perf_fd);
+    if (count < 0) {
+        fprintf(stderr, "ks_print_perf_count: failed to read counter '%s'\n",
+                event_name ? event_name : "<unknown>");
+        return;
+    }
+    printf("[perf] %s: %" PRId64 "\n", event_name ? event_name : "count", count);
+}|}
+    else "" in
+
+    let functions_list = List.filter (fun s -> s <> "") [mkdir_helper_function; attachment_storage; load_function; attach_function; detach_function; perf_attach_function; daemon_function; exec_function] in
     if functions_list = [] && bpf_obj_decl = "" then ""
     else
       sprintf "\n/* BPF Helper Functions (generated only when used) */\n%s\n\n%s" 

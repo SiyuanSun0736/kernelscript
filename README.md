@@ -119,6 +119,13 @@ fn traffic_shaper(ctx: *__sk_buff) -> i32 {
     // Trace system call entry
     return 0
 }
+
+// Perf event program for hardware counter sampling
+@perf_event
+fn on_branch_miss(ctx: *bpf_perf_event_data) -> i32 {
+    // Runs on every hardware branch-miss event
+    return 0
+}
 ```
 
 ### Type System
@@ -261,6 +268,50 @@ fn main() -> i32 {
 }
 ```
 
+### Hardware Performance Counter Programs
+
+Use `@perf_event` to attach eBPF programs to hardware or software performance counters. The userspace side describes the counter via a `perf_event_attr` struct literal and calls `attach(prog, attr)`:
+
+```kernelscript
+// eBPF program fires on every hardware branch-miss sample
+@perf_event
+fn on_branch_miss(ctx: *bpf_perf_event_data) -> i32 {
+    return 0
+}
+
+fn main() -> i32 {
+    var attr = perf_event_attr {
+        counter: branch_misses,   // hardware counter (see perf_counter enum)
+        pid: -1,                  // all processes
+        cpu: 0,                   // CPU 0
+        period: 1000000,          // sample every 1 million events
+        wakeup: 1,
+        inherit: false,
+        exclude_kernel: false,
+        exclude_user: false
+    }
+
+    var prog = load(on_branch_miss)
+    attach(prog, attr)    // opens perf_event_open fd, resets, attaches BPF, enables
+    detach(prog)          // disables counter, destroys BPF link, closes fd
+    return 0
+}
+```
+
+**Available `perf_counter` values:**
+
+| Enum value | Hardware/software event |
+|---|---|
+| `cpu_cycles` | `PERF_COUNT_HW_CPU_CYCLES` |
+| `instructions` | `PERF_COUNT_HW_INSTRUCTIONS` |
+| `cache_references` | `PERF_COUNT_HW_CACHE_REFERENCES` |
+| `cache_misses` | `PERF_COUNT_HW_CACHE_MISSES` |
+| `branch_instructions` | `PERF_COUNT_HW_BRANCH_INSTRUCTIONS` |
+| `branch_misses` | `PERF_COUNT_HW_BRANCH_MISSES` |
+| `page_faults` | `PERF_COUNT_SW_PAGE_FAULTS` |
+| `context_switches` | `PERF_COUNT_SW_CONTEXT_SWITCHES` |
+| `cpu_migrations` | `PERF_COUNT_SW_CPU_MIGRATIONS` |
+
 📖 **For detailed language specification, syntax reference, and advanced features, please read [`SPEC.md`](SPEC.md).**
 
 🔧 **For complete builtin functions reference, see [`BUILTINS.md`](BUILTINS.md).**
@@ -304,6 +355,7 @@ my_project/
 - `tc` - Traffic control programs  
 - `probe` - Kernel function probing
 - `tracepoint` - Kernel tracepoint programs
+- `perf_event` - Hardware/software performance counter programs
 
 **Available struct_ops:**
 - `tcp_congestion_ops` - TCP congestion control

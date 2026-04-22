@@ -35,7 +35,7 @@ var flows : hash<IpAddress, PacketStats>(1024)
 KernelScript uses a simple and clear scoping model that eliminates ambiguity:
 
 - **`@helper` functions**: Kernel-shared functions - accessible by all eBPF programs, compile to eBPF bytecode
-- **Attributed functions** (e.g., `@xdp`, `@tc`, `@tracepoint`): eBPF program entry points - compile to eBPF bytecode
+- **Attributed functions** (e.g., `@xdp`, `@tc`, `@tracepoint`, `@perf_event`): eBPF program entry points - compile to eBPF bytecode
 - **Regular functions**: User space - functions and data structures compile to native executable
 - **Maps and global configs**: Shared resources accessible from both kernel and user space
 - **No wrapper syntax**: Direct, flat structure without unnecessary nesting
@@ -438,6 +438,98 @@ kernelscript init tracepoint/syscalls/sys_enter_read my_syscall_tracer
 
 # The init command automatically extracts BTF structures and generates
 # appropriate KernelScript templates with correct context types
+```
+
+#### 3.1.3 Perf Event Programs
+
+`@perf_event` programs attach eBPF logic to hardware or software performance counters via `perf_event_open(2)`. The eBPF function is invoked for every counter sample; the userspace side controls which counter to monitor through a `perf_event_attr` struct literal passed to `attach()`.
+
+**Syntax:**
+```kernelscript
+@perf_event
+fn <handler_name>(ctx: *bpf_perf_event_data) -> i32 {
+    // runs on every sample
+    return 0
+}
+```
+
+The context type is always `*bpf_perf_event_data` (from `vmlinux.h`).
+
+**Userspace lifecycle:**
+```kernelscript
+fn main() -> i32 {
+    var attr = perf_event_attr {
+        counter: branch_misses,   // perf_counter enum value
+        pid: -1,                  // -1 = all processes; ≥0 = specific PID
+        cpu: 0,                   // ≥0 = specific CPU; -1 = any CPU (pid must be ≥0)
+        period: 1000000,          // sample after this many events (0 → default 1000000)
+        wakeup: 1,                // wake userspace after N samples  (0 → default 1)
+        inherit: false,           // inherit to forked children
+        exclude_kernel: false,    // exclude kernel-mode samples
+        exclude_user: false       // exclude user-mode samples
+    }
+
+    var prog = load(my_handler)
+    attach(prog, attr)   // perf_event_open → IOC_RESET → attach BPF → IOC_ENABLE
+    // ... run workload ...
+    detach(prog)         // IOC_DISABLE → bpf_link__destroy → close(perf_fd)
+    return 0
+}
+```
+
+**`pid` / `cpu` rules enforced at runtime:**
+
+| `pid` | `cpu` | Meaning |
+|---|---|---|
+| ≥ 0 | ≥ 0 | Specific process on specific CPU |
+| ≥ 0 | -1 | Specific process on any CPU |
+| -1 | ≥ 0 | All processes on specific CPU (system-wide) |
+| -1 | -1 | **Invalid** — rejected with error |
+
+**`perf_counter` enum:**
+
+| Value | Linux constant |
+|---|---|
+| `cpu_cycles` | `PERF_COUNT_HW_CPU_CYCLES` |
+| `instructions` | `PERF_COUNT_HW_INSTRUCTIONS` |
+| `cache_references` | `PERF_COUNT_HW_CACHE_REFERENCES` |
+| `cache_misses` | `PERF_COUNT_HW_CACHE_MISSES` |
+| `branch_instructions` | `PERF_COUNT_HW_BRANCH_INSTRUCTIONS` |
+| `branch_misses` | `PERF_COUNT_HW_BRANCH_MISSES` |
+| `page_faults` | `PERF_COUNT_SW_PAGE_FAULTS` |
+| `context_switches` | `PERF_COUNT_SW_CONTEXT_SWITCHES` |
+| `cpu_migrations` | `PERF_COUNT_SW_CPU_MIGRATIONS` |
+
+**Generated C helpers (emitted when `attach(prog, attr)` is used):**
+
+| Function | Signature | Description |
+|---|---|---|
+| `ks_open_perf_event` | `int (ks_perf_event_attr)` | Calls `perf_event_open(2)`, returns fd |
+| `ks_read_perf_count` | `int64_t (int perf_fd)` | Reads current 64-bit counter via `read()` |
+| `ks_print_perf_count` | `void (int perf_fd, const char*)` | Prints `[perf] <name>: <count>` to stdout |
+
+**Attach sequence (compiler-generated):**
+1. `ks_attr.attr.disabled = 1` — open counter without starting it  
+2. `syscall(SYS_perf_event_open, ...)` → `perf_fd`  
+3. `ioctl(perf_fd, PERF_EVENT_IOC_RESET, 0)` — zero the counter  
+4. `bpf_program__attach_perf_event(prog, perf_fd)` — link BPF program  
+5. `ioctl(perf_fd, PERF_EVENT_IOC_ENABLE, 0)` — **start counting**  
+
+**Detach sequence (compiler-generated):**
+1. `ioctl(perf_fd, PERF_EVENT_IOC_DISABLE, 0)` — stop counting  
+2. `bpf_link__destroy(link)` — unlink BPF program  
+3. `close(perf_fd)` — release the kernel perf event  
+
+**Compiler implementation:**
+- Detects `attach(prog, perf_event_attr_value)` call (two-argument form) and emits `ks_open_perf_event` + `attach_bpf_program_by_fd` sequence
+- Validates `pid ≥ -1`, `cpu ≥ -1`, and rejects `pid == -1 && cpu == -1` at runtime
+- Emits `PERF_FLAG_FD_CLOEXEC` for safe fd inheritance
+- BPF program section is `SEC("perf_event")`
+
+**Project Initialization:**
+```bash
+# Initialize a perf_event project
+kernelscript init perf_event my_perf_monitor
 ```
 
 ### 3.2 Named Configuration Blocks

@@ -83,17 +83,22 @@ fn main() -> i32 {
 
 ---
 
-#### `attach(handle, target, flags)`
+#### `attach(handle, target, flags)` / `attach(handle, attr)`
 **Signature:** `attach(handle: ProgramHandle, target: str(128), flags: u32) -> u32`
+**Signature:** `attach(handle: ProgramHandle, attr: perf_event_attr) -> u32`
 **Variadic:** No
 **Context:** Userspace only
 
-**Description:** Attach a loaded eBPF program to a target interface or attachment point.
+**Description:** Attach a loaded eBPF program to a target interface or attachment point, or attach it to a perf event described by `perf_event_attr`.
 
 **Parameters:**
-- `handle`: Program handle returned from `load()`
-- `target`: Target interface name (e.g., "eth0", "lo") or attachment point
-- `flags`: Attachment flags (context-dependent)
+- Standard form:
+    - `handle`: Program handle returned from `load()`
+    - `target`: Target interface name (e.g., "eth0", "lo") or attachment point
+    - `flags`: Attachment flags (context-dependent)
+- Perf event form:
+    - `handle`: Program handle returned from `load()`
+    - `attr`: `perf_event_attr` value describing counter, pid, cpu, period, and filter flags
 
 **Return Value:**
 - Returns `0` on success
@@ -106,11 +111,25 @@ var result = attach(prog, "eth0", 0)
 if (result != 0) {
     print("Failed to attach program")
 }
+
+var perf_attr = perf_event_attr {
+    counter: branch_misses,
+    pid: -1,
+    cpu: 0,
+    period: 1000000,
+    wakeup: 1,
+    inherit: false,
+    exclude_kernel: false,
+    exclude_user: false
+}
+
+var perf_prog = load(on_branch_miss)
+attach(perf_prog, perf_attr)
 ```
 
 **Context-specific implementations:**
 - **eBPF:** Not available
-- **Userspace:** Uses `bpf_prog_attach` system call
+- **Userspace:** Uses `attach_bpf_program_by_fd` for standard targets and `ks_open_perf_event` for perf events
 - **Kernel Module:** Not available
 
 ---
@@ -340,7 +359,7 @@ fn main() -> i32 {
 |----------|------|-----------|---------------|-------|
 | `print()` | ✅ | ✅ | ✅ | Different output destinations |
 | `load()` | ❌ | ✅ | ❌ | Program management only |
-| `attach()` | ❌ | ✅ | ❌ | Program management only |
+| `attach()` | ❌ | ✅ | ❌ | Standard attach and perf_event_attr attach |
 | `detach()` | ❌ | ✅ | ❌ | Program management only |
 | `register()` | ❌ | ✅ | ❌ | struct_ops registration |
 | `test()` | ❌ | ✅ | ❌ | Testing framework only |
