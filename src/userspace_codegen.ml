@@ -2344,8 +2344,10 @@ let collect_function_usage_from_ir_function ?(global_variables = []) ir_func =
 
 type struct_ops_main_registration = {
   result_value: ir_value;
-  result_name: string;
+  result_name: string;          (** variable holding the attach() return value *)
   instance_name: string;
+  terminal_return_name: string; (** raw IR name of the variable main() returns *)
+  terminal_return_value: ir_value; (** ir_value of the final return - used for C name generation *)
 }
 
 let ir_value_variable_name ir_value =
@@ -2362,6 +2364,9 @@ let struct_ops_instance_name ir_value =
        | IRStruct (name, _) -> Some name
        | _ -> None)
 
+(** Find the single struct_ops registration in [ir_func] and the variable
+    that is ultimately returned from [main].  Returns [None] if the pattern
+    cannot be identified unambiguously from the IR. *)
 let find_struct_ops_main_registration ir_func =
   let registrations = List.fold_left (fun acc block ->
     List.fold_left (fun inner_acc instr ->
@@ -2369,7 +2374,9 @@ let find_struct_ops_main_registration ir_func =
       | IRStructOpsRegister (result_val, struct_ops_val) ->
           (match ir_value_variable_name result_val, struct_ops_instance_name struct_ops_val with
            | Some result_name, Some instance_name ->
-               { result_value = result_val; result_name; instance_name } :: inner_acc
+               { result_value = result_val; result_name; instance_name;
+                 terminal_return_name = result_name;
+                 terminal_return_value = result_val } :: inner_acc
            | _ -> inner_acc)
       | _ -> inner_acc
     ) acc block.instructions
@@ -2378,86 +2385,13 @@ let find_struct_ops_main_registration ir_func =
   | last_block :: _, [registration] ->
       (match List.rev last_block.instructions with
        | { instr_desc = IRReturn (Some return_val); _ } :: _ ->
-           if ir_value_variable_name return_val = Some registration.result_name then
-             Some registration
-           else
-             None
+           let terminal_return_name =
+             Option.value ~default:registration.result_name
+               (ir_value_variable_name return_val)
+           in
+           Some { registration with terminal_return_name; terminal_return_value = return_val }
        | _ -> None)
   | _ -> None
-
-let is_c_identifier value =
-  let is_ident_start = function
-    | 'a' .. 'z' | 'A' .. 'Z' | '_' -> true
-    | _ -> false
-  in
-  let is_ident_char = function
-    | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' -> true
-    | _ -> false
-  in
-  String.length value > 0
-  && is_ident_start value.[0]
-  &&
-  let rec check index =
-    if index >= String.length value then true
-    else if is_ident_char value.[index] then check (index + 1)
-    else false
-  in
-  check 1
-
-let extract_terminal_return_identifier body_c =
-  let lines = Array.of_list (String.split_on_char '\n' body_c) in
-  let rec drop_leading_blank_lines = function
-    | line :: rest when String.trim line = "" -> drop_leading_blank_lines rest
-    | remaining -> remaining
-  in
-  let rec find_last_nonempty index =
-    if index < 0 then None
-    else if String.trim lines.(index) = "" then find_last_nonempty (index - 1)
-    else Some index
-  in
-  match find_last_nonempty (Array.length lines - 1) with
-  | None -> None
-  | Some index ->
-      let trimmed_line = String.trim lines.(index) in
-      let prefix = "return " in
-      if String.length trimmed_line > String.length prefix
-         && String.sub trimmed_line 0 (String.length prefix) = prefix
-         && trimmed_line.[String.length trimmed_line - 1] = ';' then
-        let expr = String.sub trimmed_line (String.length prefix) (String.length trimmed_line - String.length prefix - 1) |> String.trim in
-        if is_c_identifier expr then
-          let kept_lines =
-            Array.to_list (Array.sub lines 0 index)
-            |> List.rev
-            |> drop_leading_blank_lines
-            |> List.rev
-          in
-          Some (String.concat "\n" kept_lines, expr)
-        else
-          None
-      else
-        None
-
-let extract_attach_result_identifier body_c instance_name =
-  let attach_call = sprintf "attach_struct_ops_%s();" instance_name in
-  let extract_identifier_from_lhs line =
-    match String.index_opt line '=' with
-    | None -> None
-    | Some eq_index ->
-        let lhs = String.sub line 0 eq_index |> String.trim in
-        if is_c_identifier lhs then Some lhs else None
-  in
-  String.split_on_char '\n' body_c
-  |> List.find_map (fun line ->
-         if String.contains line '=' && String.contains line 'a' && String.trim line <> "" then
-           let trimmed_line = String.trim line in
-           if String.length trimmed_line >= String.length attach_call
-              && String.contains trimmed_line '='
-              && String.ends_with ~suffix:attach_call trimmed_line then
-             extract_identifier_from_lhs trimmed_line
-           else
-             None
-         else
-           None)
 
 (** Generate config initialization from declaration defaults *)
 let generate_config_initialization (config_decl : Ast.config_declaration) =
@@ -2796,7 +2730,7 @@ let generate_c_function_from_ir ?(global_variables = []) ?(base_name = "") ?(con
         if index = List.length ir_func.basic_blocks - 1 then
           match struct_ops_main_registration, List.rev block.instructions with
           | Some registration, { instr_desc = IRReturn (Some return_val); _ } :: rest_rev
-            when ir_value_variable_name return_val = Some registration.result_name ->
+            when ir_value_variable_name return_val = Some registration.terminal_return_name ->
               List.rev rest_rev
           | _ -> block.instructions
         else
@@ -2811,23 +2745,10 @@ let generate_c_function_from_ir ?(global_variables = []) ?(base_name = "") ?(con
     let body_c =
       let lifecycle_info = match struct_ops_main_registration with
       | Some registration ->
-            let result_name = generate_c_value_from_ir ctx registration.result_value in
-            Some (body_c, result_name, registration.instance_name, result_name)
-      | None ->
-        (match ir_multi_prog with
-         | Some multi_prog ->
-           (match Ir.get_struct_ops_instances multi_prog with
-            | [instance] ->
-              (match extract_terminal_return_identifier body_c with
-                       | Some (body_prefix, result_name) ->
-                           let attach_result_name = match extract_attach_result_identifier body_prefix instance.ir_instance_name with
-                             | Some name -> name
-                             | None -> result_name
-                           in
-                           Some (body_prefix, result_name, instance.ir_instance_name, attach_result_name)
-               | None -> None)
-            | _ -> None)
-         | None -> None)
+            let attach_status_str = generate_c_value_from_ir ctx registration.result_value in
+            let result_str = generate_c_value_from_ir ctx registration.terminal_return_value in
+            Some (body_c, result_str, registration.instance_name, attach_status_str)
+      | None -> None
       in
       match lifecycle_info with
       | Some (body_prefix, result_str, instance_name, attach_status_str) ->
@@ -2960,7 +2881,10 @@ let generate_struct_ops_runtime_helpers base_name ir_multi_program =
     }|} instance_name instance_name instance_name)
       |> String.concat "\n\n"
     in
-    sprintf {|%s
+    sprintf {|#include <linux/capability.h>
+#include <sys/syscall.h>
+
+%s
 
 static int bump_memlock_rlimit(void) {
     struct rlimit rlim = {
@@ -2982,15 +2906,28 @@ static int bump_memlock_rlimit(void) {
     return -1;
 }
 
-static int ensure_struct_ops_privileges(void) {
-    if (geteuid() == 0) {
+/* Check whether the current process has the given effective capability bit.
+   Uses the capget(2) syscall directly to avoid a dependency on libcap. */
+static int has_effective_cap(int cap) {
+    struct __user_cap_header_struct hdr = {
+        .version = _LINUX_CAPABILITY_VERSION_3,
+        .pid     = 0,
+    };
+    struct __user_cap_data_struct data[2] = {};
+    if (syscall(__NR_capget, &hdr, data) != 0)
         return 0;
-    }
+    return !!(data[cap >> 5].effective & (1U << (cap & 31)));
+}
 
-    fprintf(stderr, "Warning: struct_ops loading typically requires root privileges or CAP_BPF/CAP_SYS_ADMIN.\n");
-    fprintf(stderr, "Continuing anyway; loading may still succeed if this process has the required capabilities.\n");
-    fprintf(stderr, "If it fails with a permission error, try: sudo ./%s\n");
-    return 0;
+static int ensure_struct_ops_privileges(void) {
+    /* struct_ops loading requires either root or CAP_BPF (39) / CAP_SYS_ADMIN (21). */
+    if (geteuid() == 0 ||
+        has_effective_cap(39) ||
+        has_effective_cap(21))
+        return 0;
+    fprintf(stderr, "Error: struct_ops loading requires root or CAP_BPF/CAP_SYS_ADMIN.\n");
+    fprintf(stderr, "Try running as root: sudo ./%s\n");
+    return -1;
 }
 
 static void cleanup_%s(void) {

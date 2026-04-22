@@ -388,6 +388,8 @@ let normalize_struct_ops_instance_name name =
   Buffer.contents buffer
 
 let generate_default_struct_ops_name instance_name =
+  (* BPF_OBJ_NAME_LEN is 16 bytes including the NUL terminator, so the
+     usable name length is 15 characters. *)
   let max_len = 15 in
   let normalized = normalize_struct_ops_instance_name instance_name in
   if String.length normalized <= max_len then normalized
@@ -406,6 +408,22 @@ let generate_default_struct_ops_name instance_name =
         if String.length abbreviated <= max_len then abbreviated
         else String.sub abbreviated 0 max_len
 
+(* Decide whether a tail-call return (IRReturnCall) should be emitted for a
+   call to [name] in the current context.
+
+   Two intentional behaviour changes vs. the previous per-site inline logic:
+
+   1. [is_function_pointer] now checks for [IRFunctionPointer] specifically
+      instead of [Hashtbl.mem ctx.variable_types name].  The old check was
+      too broad: any local variable (int, pointer, …) with the same name
+      would be treated as a function pointer and block tail-call lowering.
+
+   2. A tail call is only emitted when [current_program_type] is set to a
+      known attributed type (e.g. XDP, TC, kprobe).  Helper functions that
+      are lowered outside of an attributed program context therefore never
+      produce tail calls, which is correct because they have no prog_array
+      to dispatch into.  struct_ops methods are explicitly excluded via the
+      [StructOps] branch. *)
 let should_lower_as_implicit_tail_call ctx name =
   let is_function_pointer =
     Hashtbl.mem ctx.function_parameters name ||
