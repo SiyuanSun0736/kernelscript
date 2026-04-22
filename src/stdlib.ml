@@ -210,6 +210,17 @@ let builtin_functions = [
     kernel_impl = ""; (* Not available in kernel context *)
     validate = Some validate_exec_function;
   };
+  {
+    name = "attach_perf";
+    param_types = [ProgramHandle; Struct "perf_event_attr"]; (* program handle, ks perf attr *)
+    return_type = I32; (* Returns 0 on success, negative errno on failure *)
+    description = "Attach a loaded perf_event eBPF program to a hardware/software performance counter";
+    is_variadic = false;
+    ebpf_impl = ""; (* Not available in eBPF context *)
+    userspace_impl = "attach_perf_by_attr"; (* Custom implementation in userspace *)
+    kernel_impl = "";
+    validate = None;
+  };
 
 ]
 
@@ -273,6 +284,31 @@ let builtin_types = [
     ("TC_ACT_REPEAT", Some (Ast.Signed64 6L));
     ("TC_ACT_REDIRECT", Some (Ast.Signed64 7L));
     ("TC_ACT_TRAP", Some (Ast.Signed64 8L));
+  ], builtin_pos));
+
+  (* perf_counter enum: KernelScript abstraction for hardware/software performance counters *)
+  TypeDef (EnumDef ("perf_counter", [
+    ("cpu_cycles",           Some (Ast.Signed64 0L));
+    ("instructions",         Some (Ast.Signed64 1L));
+    ("cache_references",     Some (Ast.Signed64 2L));
+    ("cache_misses",         Some (Ast.Signed64 3L));
+    ("branch_instructions",  Some (Ast.Signed64 4L));
+    ("branch_misses",        Some (Ast.Signed64 5L));
+    ("page_faults",          Some (Ast.Signed64 6L));
+    ("context_switches",     Some (Ast.Signed64 7L));
+    ("cpu_migrations",       Some (Ast.Signed64 8L));
+  ], builtin_pos));
+
+  (* perf_event_attr: KernelScript struct for specifying perf event configuration *)
+  TypeDef (StructDef ("perf_event_attr", [
+    ("counter",        Enum "perf_counter");
+    ("pid",            I32);
+    ("cpu",            I32);
+    ("period",         U64);
+    ("wakeup",         U32);
+    ("inherit",        Bool);
+    ("exclude_kernel", Bool);
+    ("exclude_user",   Bool);
   ], builtin_pos));
 ]
 

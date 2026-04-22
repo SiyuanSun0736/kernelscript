@@ -2476,6 +2476,7 @@ let type_check_ast ?symbol_table:(provided_symbol_table=None) ast =
                | "tc" -> Some Tc  
 
                | "tracepoint" -> Some Tracepoint
+               | "perf_event" -> Some PerfEvent
                | "kfunc" -> None  (* kfuncs don't have program types *)
                | "private" -> None  (* private functions don't have program types *)
                | "helper" -> None  (* helper functions don't have program types *)
@@ -3010,6 +3011,7 @@ let rec type_check_and_annotate_ast ?symbol_table:(provided_symbol_table=None) ?
                | "tracepoint" -> 
                    (* Reject old format: @tracepoint without category/event *)
                    type_error ("@tracepoint requires category/event specification. Use @tracepoint(\"category/event\") instead.") attr_func.attr_pos
+               | "perf_event" -> (Some PerfEvent, None)
                | "kfunc" -> (None, None)  (* kfuncs don't have program types *)
                | "private" -> (None, None)  (* private functions don't have program types *)
                | "helper" -> (None, None)  (* helper functions don't have program types *)
@@ -3118,6 +3120,17 @@ let rec type_check_and_annotate_ast ?symbol_table:(provided_symbol_table=None) ?
              
              if not valid_return_type then
                type_error (sprintf "@%s attributed function must return i32" probe_type_name) attr_func.attr_pos
+           | Some PerfEvent ->
+             (* @perf_event: must have exactly one param *bpf_perf_event_data and return i32 *)
+             let params = attr_func.attr_function.func_params in
+             let resolved_return_type = match get_return_type attr_func.attr_function.func_return_type with
+               | Some ret_type -> Some (resolve_user_type ctx ret_type)
+               | None -> None in
+             if List.length params <> 1 then
+               type_error "@perf_event attributed function must have exactly one parameter (ctx: *bpf_perf_event_data)" attr_func.attr_pos;
+             (match resolved_return_type with
+              | Some I32 -> ()
+              | _ -> type_error "@perf_event attributed function must return i32" attr_func.attr_pos)
            | Some _ -> () (* Other program types - validation can be added later *)
            | None -> type_error ("Invalid or unsupported attribute") attr_func.attr_pos);
         
@@ -3402,6 +3415,7 @@ and populate_multi_program_context ast multi_prog_analysis =
               (match prog_type_str with
                | "xdp" -> Some Xdp
                | "tracepoint" -> Some Tracepoint
+               | "perf_event" -> Some PerfEvent
                | _ -> None)
           | AttributeWithArg (attr_name, _) :: _ ->
               (match attr_name with

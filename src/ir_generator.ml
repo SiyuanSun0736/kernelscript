@@ -2877,6 +2877,7 @@ let lower_multi_program ast symbol_table source_name =
                     | "xdp" -> Ast.Xdp
                     | "tc" -> Ast.Tc
                     | "tracepoint" -> Ast.Tracepoint
+                    | "perf_event" -> Ast.PerfEvent
                     | _ -> failwith ("Unknown program type: " ^ prog_type_str)
                   in
                   Some {
