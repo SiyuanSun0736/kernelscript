@@ -8,7 +8,7 @@ fn on_branch_miss(ctx: *bpf_perf_event_data) -> i32 {
     return 0
 }
 
-fn main(args: Args) -> i32 {
+fn main() -> i32 {
     var attr = perf_event_attr {
         counter: branch_misses,
         pid: -1,
@@ -22,6 +22,7 @@ fn main(args: Args) -> i32 {
 
     var prog = load(on_branch_miss)
     attach_perf(prog, attr)
+    detach(prog)
 
     return 0
 }

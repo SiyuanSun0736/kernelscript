@@ -1346,9 +1346,16 @@ and lower_statement ctx stmt =
                      let _ = lower_expression ctx expr in
                      ())
             | _ ->
-                (* Non-void function - use normal expression handling *)
-                let _ = lower_expression ctx expr in
-                ())
+                (* Non-void function call used as statement - discard return value *)
+                (match callee_expr.expr_desc with
+                 | Ast.Identifier name ->
+                     let arg_vals = List.map (lower_expression ctx) args in
+                     let instr = make_ir_instruction (IRCall (DirectCall name, arg_vals, None)) expr.expr_pos in
+                     emit_instruction ctx instr
+                 | _ ->
+                     (* Complex callee (function pointer) - use normal expression handling *)
+                     let _ = lower_expression ctx expr in
+                     ()))
        | _ ->
            (* Non-function call expression - use normal handling *)
            let _ = lower_expression ctx expr in

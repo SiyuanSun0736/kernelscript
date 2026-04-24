@@ -3537,6 +3537,7 @@ let generate_complete_userspace_program_from_ir ?(config_declarations = []) ?(ta
   let perf_event_defs = if all_usage.uses_attach_perf then {|
 #include <linux/perf_event.h>
 #include <sys/syscall.h>
+#include <sys/ioctl.h>
 #include <dirent.h>
 
 /* KernelScript perf_event types */
@@ -3759,8 +3760,8 @@ void cleanup_bpf_maps(void) {
     
     let load_function = generate_load_function_with_tail_calls base_name all_usage tail_call_analysis all_setup_code kfunc_dependencies (Ir.get_global_variables ir_multi_prog) in
     
-    (* Global attachment storage (generated only when attach/detach are used) *)
-    let attachment_storage = if all_usage.uses_attach || all_usage.uses_detach then
+    (* Global attachment storage (generated when attach/detach/attach_perf are used) *)
+    let attachment_storage = if all_usage.uses_attach || all_usage.uses_detach || all_usage.uses_attach_perf then
       {|// Global attachment storage for tracking active program attachments
 struct attachment_entry {
     int prog_fd;
@@ -4083,7 +4084,7 @@ static int add_attachment(int prog_fd, const char *target, uint32_t flags,
 }|}
     else "" in
 
-    let detach_function = if all_usage.uses_detach then
+    let detach_function = if all_usage.uses_detach || all_usage.uses_attach_perf then
       {|void detach_bpf_program_by_fd(int prog_fd) {
     if (prog_fd < 0) {
         fprintf(stderr, "Invalid program file descriptor: %d\n", prog_fd);
@@ -4141,6 +4142,15 @@ static int add_attachment(int prog_fd, const char *target, uint32_t flags,
                 printf("TC program detached from interface: %s\n", entry->target);
             } else {
                 fprintf(stderr, "Invalid TC program link for program fd %d\n", prog_fd);
+            }
+            break;
+        }
+        case BPF_PROG_TYPE_PERF_EVENT: {
+            if (entry->link) {
+                bpf_link__destroy(entry->link);
+                printf("Perf event program detached\n");
+            } else {
+                fprintf(stderr, "Invalid perf event link for program fd %d\n", prog_fd);
             }
             break;
         }
@@ -4367,6 +4377,9 @@ static int ensure_bpf_dir(const char *path) {
     /* ioctl to enable the perf event */
     ioctl(perf_fd, PERF_EVENT_IOC_RESET, 0);
     ioctl(perf_fd, PERF_EVENT_IOC_ENABLE, 0);
+    
+    /* Track attachment for detach() support */
+    add_attachment(prog_fd, "perf_event", 0, link, 0, BPF_PROG_TYPE_PERF_EVENT);
     
     printf("perf event attached (counter=%d, pid=%d, cpu=%d)\n", ks_attr.counter, pid, cpu);
     return 0;
