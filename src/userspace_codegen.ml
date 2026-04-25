@@ -3575,15 +3575,19 @@ typedef enum {
     cpu_migrations = 8
 } perf_counter;
 
+/* ks_perf_event_attr wraps the BTF-derived struct perf_event_attr.
+ * The inner 'attr' field holds the actual kernel perf_event_attr (from linux/perf_event.h).
+ * The remaining fields are KernelScript extensions passed to perf_event_open separately. */
 typedef struct {
-    int32_t counter;
-    int32_t pid;
-    int32_t cpu;
-    uint64_t period;
-    uint32_t wakeup;
-    bool inherit;
-    bool exclude_kernel;
-    bool exclude_user;
+    struct perf_event_attr attr;  /* kernel perf event attributes (BTF-derived type) */
+    int32_t counter;              /* KernelScript perf_counter enum value */
+    int32_t pid;                  /* process ID (-1 for all processes) */
+    int32_t cpu;                  /* CPU number (-1 for any CPU) */
+    uint64_t period;              /* sampling period (0 = default 1000000) */
+    uint32_t wakeup;              /* wakeup after N events (0 = default 1) */
+    bool inherit;                 /* inherit to child processes */
+    bool exclude_kernel;          /* exclude kernel events */
+    bool exclude_user;            /* exclude user events */
 } ks_perf_event_attr;
 
 |}
@@ -4411,17 +4415,17 @@ static int ensure_bpf_dir(const char *path) {
             return -1;
     }
 
-    /* Build struct perf_event_attr */
-    struct perf_event_attr attr = {};
-    attr.type = perf_type;
-    attr.size = sizeof(struct perf_event_attr);
-    attr.config = perf_config;
-    attr.sample_period = ks_attr.period > 0 ? ks_attr.period : 1000000;
-    attr.wakeup_events = ks_attr.wakeup > 0 ? ks_attr.wakeup : 1;
-    attr.inherit = ks_attr.inherit ? 1 : 0;
-    attr.exclude_kernel = ks_attr.exclude_kernel ? 1 : 0;
-    attr.exclude_user = ks_attr.exclude_user ? 1 : 0;
-    attr.disabled = 1;
+    /* Fill the BTF-derived struct perf_event_attr from KernelScript fields */
+    ks_attr.attr.type = perf_type;
+    ks_attr.attr.size = sizeof(struct perf_event_attr);
+    ks_attr.attr.config = perf_config;
+    ks_attr.attr.sample_type = 0;
+    ks_attr.attr.sample_period = ks_attr.period > 0 ? ks_attr.period : 1000000;
+    ks_attr.attr.wakeup_events = ks_attr.wakeup > 0 ? ks_attr.wakeup : 1;
+    ks_attr.attr.inherit = ks_attr.inherit ? 1 : 0;
+    ks_attr.attr.exclude_kernel = ks_attr.exclude_kernel ? 1 : 0;
+    ks_attr.attr.exclude_user = ks_attr.exclude_user ? 1 : 0;
+    ks_attr.attr.disabled = 1;
 
     int cpu = ks_attr.cpu;
     int pid = ks_attr.pid;
@@ -4439,7 +4443,7 @@ static int ensure_bpf_dir(const char *path) {
         return -1;
     }
 
-    int perf_fd = (int)syscall(SYS_perf_event_open, &attr, pid, cpu, -1, PERF_FLAG_FD_CLOEXEC);
+    int perf_fd = (int)syscall(SYS_perf_event_open, &ks_attr.attr, pid, cpu, -1, PERF_FLAG_FD_CLOEXEC);
     if (perf_fd < 0) {
         fprintf(stderr, "ks_open_perf_event: perf_event_open failed: %s\n", strerror(errno));
         return -1;

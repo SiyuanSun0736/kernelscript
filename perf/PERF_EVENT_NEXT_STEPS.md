@@ -110,7 +110,7 @@
 建议：
 
 1. 为 `perf_event_attr` 增加“允许 multiplex”或“要求归一化输出”的高层开关，而不是把 `read_format` 细节直接暴露给用户。
-2. userspace helper 在打开 perf event 时启用 `PERF_FORMAT_TOTAL_TIME_ENABLED` 和 `PERF_FORMAT_TOTAL_TIME_RUNNING`。
+2. userspace helper 在打开 perf event 时启用 `attr.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING`，而不是只保留当前的最小 open/attach 路径。
 3. 如果发生 multiplex，就在生成的 userspace runtime 里把读数转换成归一化值，避免用户误把原始值当成真实计数。
 4. 对于不支持归一化的路径，至少在 stderr 或日志里明确提示“当前计数处于 multiplex 状态”。
 
@@ -163,6 +163,28 @@
 1. 为 `branch_misses` 这类硬件计数器提供更明确的 capability 探测。
 2. 在不支持硬件 PMU 时，允许回退到 `page_faults`、`context_switches` 这类软件 counter。
 3. 把权限、虚拟化限制、multiplex 警告统一收敛到一套 runtime diagnostics。
+
+#### 6.7 扩展更多 perf type，而不只停留在 HARDWARE / SOFTWARE
+
+当前实现本质上还是把高层 `counter` 映射到 `PERF_TYPE_HARDWARE` 和 `PERF_TYPE_SOFTWARE` 的最小子集，还没有覆盖更完整的 perf userspace ABI。
+
+建议：
+
+1. 把 `PERF_TYPE_HW_CACHE` 纳入后续设计，给 `cache id`、`cache op`、`cache result` 提供明确的高层表示，而不是继续硬编码到少数 `counter` 名称里。
+2. 把 `PERF_TYPE_TRACEPOINT` 纳入后续设计，明确 tracepoint event id 的发现方式，以及它与现有 `@tracepoint` 程序模型之间的关系，避免语言层出现两个互相割裂的 tracepoint 入口。
+3. 预留 `PERF_TYPE_RAW`、`PERF_TYPE_BREAKPOINT` 等更底层类型的扩展位，但不要在第一步就把原始 bit layout 直接暴露给用户；最好先设计一层可校验、可降级的高层配置。
+4. 如果未来支持这些 type，需要同步扩展 `perf_event_attr` 的高层抽象，避免目前只靠 `counter -> type/config` 的单向映射把表达能力锁死。
+
+#### 6.8 BTF 集成还需要继续补齐
+
+当前 perf_event 的 BTF 集成只覆盖了 eBPF 侧上下文类型 `bpf_perf_event_data`，还没有把 perf userspace ABI 相关的信息系统性纳入编译器和模板链路。
+
+建议：
+
+1. 把 `perf_event.kh` 的生成和使用继续规范化，明确它负责的是 eBPF 侧 context/type，而不是 userspace 侧 `struct perf_event_attr` 的完整镜像。
+2. 单独规划 `perf_event_attr` 的 BTF 方案：由于它包含 bitfield、匿名 union 和大量 ABI 细节，不能直接等价映射成当前的 KernelScript struct 语法，需要决定是保持高层包装结构，还是新增一套更接近 C ABI 的表示能力。
+3. 评估是否要把 `enum perf_type_id`、`enum perf_hw_id`、`enum perf_hw_cache_id`、`enum perf_hw_cache_op_id`、`enum perf_hw_cache_op_result_id` 这类 perf 常量通过 BTF 或生成步骤统一纳入，而不是继续在 userspace helper 中分散硬编码。
+4. 如果后续支持 `PERF_TYPE_TRACEPOINT`、`PERF_TYPE_HW_CACHE` 等新类型，需要一起补它们对应的 BTF 提取、常量生成和模板测试，否则语言层 capability 会继续和内核 ABI 脱节。
 
 ## 推荐执行顺序
 

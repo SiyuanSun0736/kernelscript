@@ -26,41 +26,7 @@
 #endif
 
 /* Generated from KernelScript IR */
-#include "perf_branch_miss.skel.h"
-
-#include <linux/perf_event.h>
-#include <sys/syscall.h>
-#include <sys/ioctl.h>
-#include <dirent.h>
-
-/* KernelScript perf_event types */
-typedef enum {
-    cpu_cycles = 0,
-    instructions = 1,
-    cache_references = 2,
-    cache_misses = 3,
-    branch_instructions = 4,
-    branch_misses = 5,
-    page_faults = 6,
-    context_switches = 7,
-    cpu_migrations = 8
-} perf_counter;
-
-/* ks_perf_event_attr wraps the BTF-derived struct perf_event_attr.
- * The inner 'attr' field holds the actual kernel perf_event_attr (from linux/perf_event.h).
- * The remaining fields are KernelScript extensions passed to perf_event_open separately. */
-typedef struct {
-    struct perf_event_attr attr;  /* kernel perf event attributes (BTF-derived type) */
-    int32_t counter;              /* KernelScript perf_counter enum value */
-    int32_t pid;                  /* process ID (-1 for all processes) */
-    int32_t cpu;                  /* CPU number (-1 for any CPU) */
-    uint64_t period;              /* sampling period (0 = default 1000000) */
-    uint32_t wakeup;              /* wakeup after N events (0 = default 1) */
-    bool inherit;                 /* inherit to child processes */
-    bool exclude_kernel;          /* exclude kernel events */
-    bool exclude_user;            /* exclude user events */
-} ks_perf_event_attr;
-
+#include "struct_ops_simple.skel.h"
 
 
 
@@ -75,7 +41,7 @@ typedef struct {
 
 
 /* eBPF skeleton instance */
-struct perf_branch_miss_ebpf *obj = NULL;
+struct struct_ops_simple_ebpf *obj = NULL;
 
 
 
@@ -165,28 +131,6 @@ static int add_attachment(int prog_fd, const char *target, uint32_t flags,
     return 0;
 }
 
-
-int get_bpf_program_handle(const char *program_name) {
-    if (!obj) {
-        fprintf(stderr, "eBPF skeleton not loaded - this should not happen with implicit loading\n");
-        return -1;
-    }
-    
-    struct bpf_program *prog = bpf_object__find_program_by_name(obj->obj, program_name);
-    if (!prog) {
-        fprintf(stderr, "Failed to find program '%s' in BPF object\n", program_name);
-        return -1;
-    }
-    
-    int prog_fd = bpf_program__fd(prog);
-    if (prog_fd < 0) {
-        fprintf(stderr, "Failed to get file descriptor for program '%s'\n", program_name);
-        return -1;
-    }
-    
-
-    return prog_fd;
-}
 
 int attach_bpf_program_by_fd(int prog_fd, const char *target, int flags) {
     if (prog_fd < 0) {
@@ -495,199 +439,38 @@ int attach_bpf_program_by_fd(int prog_fd, const char *target, int flags) {
     }
 }
 
-void detach_bpf_program_by_fd(int prog_fd) {
-    if (prog_fd < 0) {
-        fprintf(stderr, "Invalid program file descriptor: %d\n", prog_fd);
-        return;
-    }
-    
-    // Find the attachment entry
-    struct attachment_entry *entry = find_attachment(prog_fd);
-    if (!entry) {
-        fprintf(stderr, "No active attachment found for program fd %d\n", prog_fd);
-        return;
-    }
-    
-    // Detach based on program type
-    switch (entry->type) {
-        case BPF_PROG_TYPE_XDP: {
-            int ret = bpf_xdp_detach(entry->ifindex, entry->flags, NULL);
-            if (ret) {
-                fprintf(stderr, "Failed to detach XDP program from interface: %s\n", strerror(errno));
-            } else {
-                printf("XDP detached from interface index: %d\n", entry->ifindex);
-            }
-            break;
-        }
-        case BPF_PROG_TYPE_KPROBE: {
-            if (entry->link) {
-                bpf_link__destroy(entry->link);
-                printf("Kprobe detached from: %s\n", entry->target);
-            } else {
-                fprintf(stderr, "Invalid kprobe link for program fd %d\n", prog_fd);
-            }
-            break;
-        }
-        case BPF_PROG_TYPE_TRACING: {
-            if (entry->link) {
-                bpf_link__destroy(entry->link);
-                printf("Fentry/fexit program detached from: %s\n", entry->target);
-            } else {
-                fprintf(stderr, "Invalid tracing program link for program fd %d\n", prog_fd);
-            }
-            break;
-        }
-        case BPF_PROG_TYPE_TRACEPOINT: {
-            if (entry->link) {
-                bpf_link__destroy(entry->link);
-                printf("Tracepoint detached from: %s\n", entry->target);
-            } else {
-                fprintf(stderr, "Invalid tracepoint link for program fd %d\n", prog_fd);
-            }
-            break;
-        }
-        case BPF_PROG_TYPE_SCHED_CLS: {
-            if (entry->link) {
-                bpf_link__destroy(entry->link);
-                printf("TC program detached from interface: %s\n", entry->target);
-            } else {
-                fprintf(stderr, "Invalid TC program link for program fd %d\n", prog_fd);
-            }
-            break;
-        }
-        case BPF_PROG_TYPE_PERF_EVENT: {
-          if (entry->perf_fd >= 0 && ioctl(entry->perf_fd, PERF_EVENT_IOC_DISABLE, 0) != 0) {
-            fprintf(stderr, "Failed to disable perf event: %s\n", strerror(errno));
-          }
-            if (entry->link) {
-                bpf_link__destroy(entry->link);
-            } else {
-                fprintf(stderr, "Invalid perf event link for program fd %d\n", prog_fd);
-            }
-          if (entry->perf_fd >= 0) {
-            close(entry->perf_fd);
-          }
-          printf("Perf event program detached\n");
-            break;
-        }
-        default:
-            fprintf(stderr, "Unsupported program type for detachment: %d\n", entry->type);
-            break;
-    }
-    
-    // Remove from tracking
-    remove_attachment(prog_fd);
-}
-
-int ks_open_perf_event(ks_perf_event_attr ks_attr) {
-    /* Map KernelScript perf_counter enum to PERF_TYPE_* and PERF_COUNT_* */
-    __u32 perf_type;
-    __u64 perf_config;
-    switch (ks_attr.counter) {
-        case 0: /* cpu_cycles */
-            perf_type = PERF_TYPE_HARDWARE;
-            perf_config = PERF_COUNT_HW_CPU_CYCLES;
-            break;
-        case 1: /* instructions */
-            perf_type = PERF_TYPE_HARDWARE;
-            perf_config = PERF_COUNT_HW_INSTRUCTIONS;
-            break;
-        case 2: /* cache_references */
-            perf_type = PERF_TYPE_HARDWARE;
-            perf_config = PERF_COUNT_HW_CACHE_REFERENCES;
-            break;
-        case 3: /* cache_misses */
-            perf_type = PERF_TYPE_HARDWARE;
-            perf_config = PERF_COUNT_HW_CACHE_MISSES;
-            break;
-        case 4: /* branch_instructions */
-            perf_type = PERF_TYPE_HARDWARE;
-            perf_config = PERF_COUNT_HW_BRANCH_INSTRUCTIONS;
-            break;
-        case 5: /* branch_misses */
-            perf_type = PERF_TYPE_HARDWARE;
-            perf_config = PERF_COUNT_HW_BRANCH_MISSES;
-            break;
-        case 6: /* page_faults */
-            perf_type = PERF_TYPE_SOFTWARE;
-            perf_config = PERF_COUNT_SW_PAGE_FAULTS;
-            break;
-        case 7: /* context_switches */
-            perf_type = PERF_TYPE_SOFTWARE;
-            perf_config = PERF_COUNT_SW_CONTEXT_SWITCHES;
-            break;
-        case 8: /* cpu_migrations */
-            perf_type = PERF_TYPE_SOFTWARE;
-            perf_config = PERF_COUNT_SW_CPU_MIGRATIONS;
-            break;
-        default:
-            fprintf(stderr, "ks_open_perf_event: unknown counter value %d\n", ks_attr.counter);
-            return -1;
-    }
-
-    /* Fill the BTF-derived struct perf_event_attr from KernelScript fields */
-    ks_attr.attr.type = perf_type;
-    ks_attr.attr.size = sizeof(struct perf_event_attr);
-    ks_attr.attr.config = perf_config;
-    ks_attr.attr.sample_type = 0;
-    ks_attr.attr.sample_period = ks_attr.period > 0 ? ks_attr.period : 1000000;
-    ks_attr.attr.wakeup_events = ks_attr.wakeup > 0 ? ks_attr.wakeup : 1;
-    ks_attr.attr.inherit = ks_attr.inherit ? 1 : 0;
-    ks_attr.attr.exclude_kernel = ks_attr.exclude_kernel ? 1 : 0;
-    ks_attr.attr.exclude_user = ks_attr.exclude_user ? 1 : 0;
-    ks_attr.attr.disabled = 1;
-
-    int cpu = ks_attr.cpu;
-    int pid = ks_attr.pid;
-
-    if (pid < -1) {
-        fprintf(stderr, "ks_open_perf_event: invalid pid %d (expected >= -1)\n", pid);
-        return -1;
-    }
-    if (cpu < -1) {
-        fprintf(stderr, "ks_open_perf_event: invalid cpu %d (expected >= -1)\n", cpu);
-        return -1;
-    }
-    if (pid == -1 && cpu == -1) {
-        fprintf(stderr, "ks_open_perf_event: system-wide perf events require an explicit cpu >= 0\n");
-        return -1;
-    }
-
-    int perf_fd = (int)syscall(SYS_perf_event_open, &ks_attr.attr, pid, cpu, -1, PERF_FLAG_FD_CLOEXEC);
-    if (perf_fd < 0) {
-        fprintf(stderr, "ks_open_perf_event: perf_event_open failed: %s\n", strerror(errno));
-        return -1;
-    }
-    return perf_fd;
-}
-
-
+int attach_struct_ops_minimal_congestion_control(void) { return 0; }
+int detach_struct_ops_minimal_congestion_control(void) { return 0; }
 
 int main(void) {
+    uint32_t var_result;
+    uint32_t __struct_ops_reg_0;
     // No arguments to parse
     // Implicit eBPF skeleton loading - makes global variables immediately accessible
     if (!obj) {
-        obj = perf_branch_miss_ebpf__open_and_load();
+        obj = struct_ops_simple_ebpf__open_and_load();
         if (!obj) {
             fprintf(stderr, "Failed to open and load eBPF skeleton\n");
             return 1;
         }
     }
-    // Note: Skeleton loaded implicitly above, load() now gets program handles
     
-    uint32_t __unop_1 = -1;
-    ks_perf_event_attr __struct_literal_0 = {.counter = branch_misses, .pid = __unop_1, .cpu = 0, .period = 1000000, .wakeup = 1, .inherit = false, .exclude_kernel = false, .exclude_user = false};
-    ks_perf_event_attr var_attr = __struct_literal_0;
-    int32_t var_prog;
-    var_prog = get_bpf_program_handle("on_branch_miss");
-    if (var_prog < 0) {
-        fprintf(stderr, "Failed to get BPF program handle\n");
-        return 1;
+    ({
+    if (!obj) {
+        fprintf(stderr, "eBPF skeleton not loaded for struct_ops registration\n");
+        __struct_ops_reg_0 = -1;
+    } else {
+        struct bpf_map *map = bpf_object__find_map_by_name(obj->obj, "minimal_congestion_control");
+        if (!map) {
+            fprintf(stderr, "Failed to find struct_ops map 'minimal_congestion_control'\n");
+            __struct_ops_reg_0 = -1;
+        } else {
+            struct bpf_link *link = bpf_map__attach_struct_ops(map);
+            __struct_ops_reg_0 = (link != NULL) ? 0 : -1;
+            if (link) bpf_link__destroy(link);
+        }
     }
-    int __ks_pfd_1 = ks_open_perf_event(var_attr);
-    char __ks_pstr_2[32];
-    snprintf(__ks_pstr_2, sizeof(__ks_pstr_2), "%d", __ks_pfd_1);
-    attach_bpf_program_by_fd(var_prog, __ks_pstr_2, 0);
-    detach_bpf_program_by_fd(var_prog);
-    return 0;
+    __struct_ops_reg_0;
+});
+    return var_result;
 }
