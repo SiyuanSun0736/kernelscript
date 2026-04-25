@@ -34,3 +34,8 @@ sudo ./perf_user -C 2
 - PID 模式只会附着到启动时刻已经存在的线程，不会自动追踪后续新建线程。
 - `sample_period = 1` 适合做最小验证，不适合高负载长期运行。
 - 用户态现在会优先从可执行文件所在目录查找 `perf.bpf.o`，因此不要求必须在当前目录运行。
+
+## 进一步阅读
+
+- 当前 `perf_event_attr` 实现说明：`PERF_ATTR.md`
+- 基于最近三次提交整理的后续方案：`PERF_EVENT_NEXT_STEPS.md`

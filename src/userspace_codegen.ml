@@ -1900,12 +1900,20 @@ let rec generate_c_instruction_from_ir ctx instruction =
                  (* Detect perf_event form: attach(handle, perf_event_attr) *)
                  (match args with
                   | [_; attr_val] when (match attr_val.val_type with IRStruct ("perf_event_attr", _) -> true | _ -> false) ->
-                      (* Perf event form: route to attach_perf_by_attr *)
+                      (* Perf event form: open perf fd via ks_open_perf_event then call attach_bpf_program_by_fd.
+                         We use the sentinel "__PERF_RAW_EMIT__" so the basic_call site emits the raw
+                         multi-statement code verbatim instead of wrapping it in a function call. *)
                       ctx.function_usage.uses_attach_perf <- true;
                       ctx.function_usage.uses_load <- true;
                       (match c_args with
                        | [program_handle; attr_arg] ->
-                           ("attach_perf_by_attr", [program_handle; attr_arg])
+                           let pfd_var  = fresh_temp_var ctx "__ks_pfd"  in
+                           let pstr_var = fresh_temp_var ctx "__ks_pstr" in
+                           let raw_code = sprintf
+                             "int %s = ks_open_perf_event(%s);\n    char %s[32];\n    snprintf(%s, sizeof(%s), \"%%d\", %s);\n    attach_bpf_program_by_fd(%s, %s, 0)"
+                             pfd_var attr_arg pstr_var pstr_var pstr_var pfd_var program_handle pstr_var
+                           in
+                           ("__PERF_RAW_EMIT__", [raw_code])
                        | _ -> failwith "attach with perf_event_attr expects exactly two arguments")
                   | _ ->
                       (* Standard form: attach(handle, target, flags) *)
@@ -1973,7 +1981,12 @@ let rec generate_c_instruction_from_ir ctx instruction =
       
       let basic_call = (match ret_opt with
        | Some result -> sprintf "%s = %s(%s);" (generate_c_value_from_ir ctx result) actual_name args_str
-       | None -> sprintf "%s(%s);" actual_name args_str) in
+       | None ->
+           (* Special case: perf_event_attr attach emits pre-built multi-statement code *)
+           if actual_name = "__PERF_RAW_EMIT__" then
+             (match translated_args with [raw] -> raw ^ ";" | _ -> failwith "__PERF_RAW_EMIT__ expects exactly one arg")
+           else
+             sprintf "%s(%s);" actual_name args_str) in
       
       (* Add error checking for load in main function *)
       if ctx.is_main && (match target with DirectCall "load" -> true | _ -> false) then
@@ -3778,6 +3791,7 @@ struct attachment_entry {
     uint32_t flags;
     struct bpf_link *link;    // For kprobe/tracepoint programs (NULL for XDP)
     int ifindex;              // For XDP programs (0 for kprobe/tracepoint)
+  int perf_fd;              // For perf_event programs (-1 otherwise)
     enum bpf_prog_type type;
     struct attachment_entry *next;
 };
@@ -3818,7 +3832,8 @@ static void remove_attachment(int prog_fd) {
 
 // Helper function to add attachment entry
 static int add_attachment(int prog_fd, const char *target, uint32_t flags, 
-                         struct bpf_link *link, int ifindex, enum bpf_prog_type type) {
+             struct bpf_link *link, int ifindex, int perf_fd,
+             enum bpf_prog_type type) {
     struct attachment_entry *entry = malloc(sizeof(struct attachment_entry));
     if (!entry) {
         fprintf(stderr, "Failed to allocate memory for attachment entry\n");
@@ -3831,6 +3846,7 @@ static int add_attachment(int prog_fd, const char *target, uint32_t flags,
     entry->flags = flags;
     entry->link = link;
     entry->ifindex = ifindex;
+    entry->perf_fd = perf_fd;
     entry->type = type;
     
     pthread_mutex_lock(&attachment_mutex);
@@ -3881,7 +3897,7 @@ static int add_attachment(int prog_fd, const char *target, uint32_t flags,
             }
             
             // Store XDP attachment (no bpf_link for XDP)
-            if (add_attachment(prog_fd, target, flags, NULL, ifindex, BPF_PROG_TYPE_XDP) != 0) {
+            if (add_attachment(prog_fd, target, flags, NULL, ifindex, -1, BPF_PROG_TYPE_XDP) != 0) {
                 // If storage fails, detach and return error
                 bpf_xdp_detach(ifindex, flags, NULL);
                 return -1;
@@ -3896,7 +3912,6 @@ static int add_attachment(int prog_fd, const char *target, uint32_t flags,
             
             // Get the bpf_program struct from the object and file descriptor
             struct bpf_program *prog = NULL;
-            struct bpf_object *obj_iter;
 
             // Find the program object corresponding to this fd
             // We need to get the program from the skeleton object
@@ -3919,14 +3934,15 @@ static int add_attachment(int prog_fd, const char *target, uint32_t flags,
             // BPF_PROG_TYPE_KPROBE programs always use kprobe attachment
             // (these are generated from @probe("target+offset"))
             struct bpf_link *link = bpf_program__attach_kprobe(prog, false, target);
-            if (!link) {
-                fprintf(stderr, "Failed to attach kprobe to function '%s': %s\n", target, strerror(errno));
+            long link_err = libbpf_get_error(link);
+            if (link_err) {
+              fprintf(stderr, "Failed to attach kprobe to function '%s': %s\n", target, strerror((int)-link_err));
                 return -1;
             }
             printf("Kprobe attached to function: %s\n", target);
             
             // Store probe attachment for later cleanup
-            if (add_attachment(prog_fd, target, flags, link, 0, BPF_PROG_TYPE_KPROBE) != 0) {
+            if (add_attachment(prog_fd, target, flags, link, 0, -1, BPF_PROG_TYPE_KPROBE) != 0) {
                 // If storage fails, destroy link and return error
                 bpf_link__destroy(link);
                 return -1;
@@ -3960,15 +3976,16 @@ static int add_attachment(int prog_fd, const char *target, uint32_t flags,
 
             // For fentry/fexit programs, use bpf_program__attach_trace
             struct bpf_link *link = bpf_program__attach_trace(prog);
-            if (!link) {
-                fprintf(stderr, "Failed to attach fentry/fexit program to function '%s': %s\n", target, strerror(errno));
+            long link_err = libbpf_get_error(link);
+            if (link_err) {
+              fprintf(stderr, "Failed to attach fentry/fexit program to function '%s': %s\n", target, strerror((int)-link_err));
                 return -1;
             }
             
             printf("Fentry/fexit program attached to function: %s\n", target);
             
             // Store tracing attachment for later cleanup
-            if (add_attachment(prog_fd, target, flags, link, 0, BPF_PROG_TYPE_TRACING) != 0) {
+            if (add_attachment(prog_fd, target, flags, link, 0, -1, BPF_PROG_TYPE_TRACING) != 0) {
                 // If storage fails, destroy link and return error
                 bpf_link__destroy(link);
                 return -1;
@@ -4020,13 +4037,14 @@ static int add_attachment(int prog_fd, const char *target, uint32_t flags,
 
             // Use libbpf's high-level tracepoint attachment API with category and event name
             struct bpf_link *link = bpf_program__attach_tracepoint(prog, category, event_name);
-            if (!link) {
-                fprintf(stderr, "Failed to attach tracepoint to '%s:%s': %s\n", category, event_name, strerror(errno));
+            long link_err = libbpf_get_error(link);
+            if (link_err) {
+              fprintf(stderr, "Failed to attach tracepoint to '%s:%s': %s\n", category, event_name, strerror((int)-link_err));
                 return -1;
             }
             
             // Store tracepoint attachment for later cleanup
-            if (add_attachment(prog_fd, target, flags, link, 0, BPF_PROG_TYPE_TRACEPOINT) != 0) {
+            if (add_attachment(prog_fd, target, flags, link, 0, -1, BPF_PROG_TYPE_TRACEPOINT) != 0) {
                 // If storage fails, destroy link and return error
                 bpf_link__destroy(link);
                 return -1;
@@ -4070,13 +4088,14 @@ static int add_attachment(int prog_fd, const char *target, uint32_t flags,
 
             // Use libbpf's TC attachment API
             struct bpf_link *link = bpf_program__attach_tcx(prog, ifindex, &tcx_opts);
-            if (!link) {
-                fprintf(stderr, "Failed to attach TC program to interface '%s': %s\n", target, strerror(errno));
+            long link_err = libbpf_get_error(link);
+            if (link_err) {
+              fprintf(stderr, "Failed to attach TC program to interface '%s': %s\n", target, strerror((int)-link_err));
                 return -1;
             }
             
             // Store TC attachment for later cleanup (flags no longer needed for direction)
-            if (add_attachment(prog_fd, target, 0, link, ifindex, BPF_PROG_TYPE_SCHED_CLS) != 0) {
+            if (add_attachment(prog_fd, target, 0, link, ifindex, -1, BPF_PROG_TYPE_SCHED_CLS) != 0) {
                 // If storage fails, destroy link and return error
                 bpf_link__destroy(link);
                 return -1;
@@ -4084,6 +4103,62 @@ static int add_attachment(int prog_fd, const char *target, uint32_t flags,
             
             printf("TC program attached to interface: %s\n", target);
             
+            return 0;
+        }
+        case BPF_PROG_TYPE_PERF_EVENT: {
+            // For perf_event programs, target should be a perf_fd as a decimal string
+            // (the perf_fd is obtained via perf_event_open by the caller or attach_perf_by_attr)
+            char *endptr = NULL;
+            long perf_fd_long = strtol(target, &endptr, 10);
+            if (endptr == target || *endptr != '\0' || perf_fd_long < 0) {
+                fprintf(stderr, "BPF_PROG_TYPE_PERF_EVENT: invalid perf_fd target '%s'. "
+                        "For perf event programs, pass an already-opened perf_fd as a decimal string, "
+                        "or use attach_perf_by_attr() instead.\n", target);
+                return -1;
+            }
+            int perf_fd_val = (int)perf_fd_long;
+
+            if (!obj) {
+                fprintf(stderr, "eBPF skeleton not loaded for perf_event attachment\n");
+                return -1;
+            }
+
+            struct bpf_program *prog = NULL;
+            bpf_object__for_each_program(prog, obj->obj) {
+                if (bpf_program__fd(prog) == prog_fd) {
+                    break;
+                }
+            }
+            if (!prog) {
+                fprintf(stderr, "Failed to find bpf_program for fd %d\n", prog_fd);
+                return -1;
+            }
+
+            if (ioctl(perf_fd_val, PERF_EVENT_IOC_RESET, 0) != 0) {
+                fprintf(stderr, "Failed to reset perf event fd %d: %s\n", perf_fd_val, strerror(errno));
+                return -1;
+            }
+
+            struct bpf_link *link = bpf_program__attach_perf_event(prog, perf_fd_val);
+            long link_err = libbpf_get_error(link);
+            if (link_err) {
+                fprintf(stderr, "Failed to attach perf_event program to perf_fd %d: %s\n", perf_fd_val, strerror((int)-link_err));
+                return -1;
+            }
+
+            if (ioctl(perf_fd_val, PERF_EVENT_IOC_ENABLE, 0) != 0) {
+                fprintf(stderr, "Failed to enable perf event fd %d: %s\n", perf_fd_val, strerror(errno));
+                bpf_link__destroy(link);
+                return -1;
+            }
+
+            if (add_attachment(prog_fd, target, flags, link, 0, perf_fd_val, BPF_PROG_TYPE_PERF_EVENT) != 0) {
+                ioctl(perf_fd_val, PERF_EVENT_IOC_DISABLE, 0);
+                bpf_link__destroy(link);
+                return -1;
+            }
+
+            printf("Perf event program attached to perf_fd: %d\n", perf_fd_val);
             return 0;
         }
         default:
@@ -4155,12 +4230,18 @@ static int add_attachment(int prog_fd, const char *target, uint32_t flags,
             break;
         }
         case BPF_PROG_TYPE_PERF_EVENT: {
+          if (entry->perf_fd >= 0 && ioctl(entry->perf_fd, PERF_EVENT_IOC_DISABLE, 0) != 0) {
+            fprintf(stderr, "Failed to disable perf event: %s\n", strerror(errno));
+          }
             if (entry->link) {
                 bpf_link__destroy(entry->link);
-                printf("Perf event program detached\n");
             } else {
                 fprintf(stderr, "Invalid perf event link for program fd %d\n", prog_fd);
             }
+          if (entry->perf_fd >= 0) {
+            close(entry->perf_fd);
+          }
+          printf("Perf event program detached\n");
             break;
         }
         default:
@@ -4284,12 +4365,7 @@ static int ensure_bpf_dir(const char *path) {
     else "" in
 
     let perf_attach_function = if all_usage.uses_attach_perf then
-      {|int attach_perf_by_attr(int prog_fd, ks_perf_event_attr ks_attr) {
-    if (prog_fd < 0) {
-        fprintf(stderr, "attach_perf: invalid program fd %d\n", prog_fd);
-        return -1;
-    }
-    
+      {|int ks_open_perf_event(ks_perf_event_attr ks_attr) {
     /* Map KernelScript perf_counter enum to PERF_TYPE_* and PERF_COUNT_* */
     __u32 perf_type;
     __u64 perf_config;
@@ -4331,10 +4407,10 @@ static int ensure_bpf_dir(const char *path) {
             perf_config = PERF_COUNT_SW_CPU_MIGRATIONS;
             break;
         default:
-            fprintf(stderr, "attach_perf: unknown counter value %d\n", ks_attr.counter);
+            fprintf(stderr, "ks_open_perf_event: unknown counter value %d\n", ks_attr.counter);
             return -1;
     }
-    
+
     /* Build struct perf_event_attr */
     struct perf_event_attr attr = {};
     attr.type = perf_type;
@@ -4346,52 +4422,29 @@ static int ensure_bpf_dir(const char *path) {
     attr.exclude_kernel = ks_attr.exclude_kernel ? 1 : 0;
     attr.exclude_user = ks_attr.exclude_user ? 1 : 0;
     attr.disabled = 1;
-    
-    int cpu = ks_attr.cpu >= 0 ? ks_attr.cpu : 0;
-    int pid = ks_attr.pid;  /* -1 = all threads on cpu */
-    
-    /* Open perf event */
+
+    int cpu = ks_attr.cpu;
+    int pid = ks_attr.pid;
+
+    if (pid < -1) {
+        fprintf(stderr, "ks_open_perf_event: invalid pid %d (expected >= -1)\n", pid);
+        return -1;
+    }
+    if (cpu < -1) {
+        fprintf(stderr, "ks_open_perf_event: invalid cpu %d (expected >= -1)\n", cpu);
+        return -1;
+    }
+    if (pid == -1 && cpu == -1) {
+        fprintf(stderr, "ks_open_perf_event: system-wide perf events require an explicit cpu >= 0\n");
+        return -1;
+    }
+
     int perf_fd = (int)syscall(SYS_perf_event_open, &attr, pid, cpu, -1, PERF_FLAG_FD_CLOEXEC);
     if (perf_fd < 0) {
-        fprintf(stderr, "attach_perf: perf_event_open failed: %s\n", strerror(errno));
+        fprintf(stderr, "ks_open_perf_event: perf_event_open failed: %s\n", strerror(errno));
         return -1;
     }
-    
-    /* Find bpf_program from skeleton and attach */
-    if (!obj) {
-        fprintf(stderr, "attach_perf: BPF skeleton not loaded\n");
-        close(perf_fd);
-        return -1;
-    }
-    
-    struct bpf_program *prog = NULL;
-    bpf_object__for_each_program(prog, obj->obj) {
-        if (bpf_program__fd(prog) == prog_fd) {
-            break;
-        }
-    }
-    if (!prog) {
-        fprintf(stderr, "attach_perf: bpf_program not found for fd %d\n", prog_fd);
-        close(perf_fd);
-        return -1;
-    }
-    
-    struct bpf_link *link = bpf_program__attach_perf_event(prog, perf_fd);
-    if (!link) {
-        fprintf(stderr, "attach_perf: bpf_program__attach_perf_event failed: %s\n", strerror(errno));
-        close(perf_fd);
-        return -1;
-    }
-    
-    /* ioctl to enable the perf event */
-    ioctl(perf_fd, PERF_EVENT_IOC_RESET, 0);
-    ioctl(perf_fd, PERF_EVENT_IOC_ENABLE, 0);
-    
-    /* Track attachment for detach() support */
-    add_attachment(prog_fd, "perf_event", 0, link, 0, BPF_PROG_TYPE_PERF_EVENT);
-    
-    printf("perf event attached (counter=%d, pid=%d, cpu=%d)\n", ks_attr.counter, pid, cpu);
-    return 0;
+    return perf_fd;
 }|}
     else "" in
 
