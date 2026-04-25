@@ -109,6 +109,18 @@ let validate_register_function arg_types ast_context _pos =
     | _ -> 
         (false, Some "register() requires an impl block argument")
 
+(** Validation function for attach() - accepts either standard 3-arg form or perf 2-arg form *)
+let validate_attach_function arg_types _ast_context _pos =
+  match arg_types with
+  | [ProgramHandle; Str _; (U8|U16|U32|U64|I8|I16|I32|I64)] ->
+      (* Standard form: attach(prog, target, flags) *)
+      (true, None)
+  | [ProgramHandle; Struct "perf_event_attr"] | [ProgramHandle; UserType "perf_event_attr"] ->
+      (* Perf event form: attach(prog, perf_event_attr) - compiler detects and routes appropriately *)
+      (true, None)
+  | _ ->
+      (false, Some "attach() requires either (handle, target, flags) or (handle, perf_event_attr)")
+
 (** Standard library built-in functions *)
 let builtin_functions = [
   {
@@ -135,14 +147,14 @@ let builtin_functions = [
   };
   {
     name = "attach";
-    param_types = [ProgramHandle; Str 128; U32]; (* program handle, target interface, flags *)
+    param_types = []; (* Custom validation handles both standard and perf_event forms *)
     return_type = U32; (* Returns 0 on success *)
-    description = "Attach a loaded eBPF program to a target with flags";
+    description = "Attach a loaded eBPF program to a target with flags, or to a perf event counter";
     is_variadic = false;
     ebpf_impl = ""; (* Not available in eBPF context *)
     userspace_impl = "bpf_prog_attach";
     kernel_impl = "";
-    validate = None;
+    validate = Some validate_attach_function;
   };
   {
     name = "detach";
@@ -209,17 +221,6 @@ let builtin_functions = [
     userspace_impl = "exec_builtin"; (* Custom implementation in userspace *)
     kernel_impl = ""; (* Not available in kernel context *)
     validate = Some validate_exec_function;
-  };
-  {
-    name = "attach_perf";
-    param_types = [ProgramHandle; Struct "perf_event_attr"]; (* program handle, ks perf attr *)
-    return_type = I32; (* Returns 0 on success, negative errno on failure *)
-    description = "Attach a loaded perf_event eBPF program to a hardware/software performance counter";
-    is_variadic = false;
-    ebpf_impl = ""; (* Not available in eBPF context *)
-    userspace_impl = "attach_perf_by_attr"; (* Custom implementation in userspace *)
-    kernel_impl = "";
-    validate = None;
   };
 
 ]

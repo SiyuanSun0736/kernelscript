@@ -704,8 +704,13 @@ let track_function_usage ctx instr =
        | DirectCall func_name ->
            (match func_name with
             | "load" -> ctx.function_usage.uses_load <- true
-            | "attach" -> ctx.function_usage.uses_attach <- true
-            | "attach_perf" -> ctx.function_usage.uses_attach_perf <- true
+            | "attach" -> 
+                ctx.function_usage.uses_attach <- true;
+                (* If called with (handle, perf_event_attr), also needs perf infrastructure *)
+                (match args with
+                 | [_; attr_val] when (match attr_val.val_type with IRStruct ("perf_event_attr", _) -> true | _ -> false) ->
+                     ctx.function_usage.uses_attach_perf <- true
+                 | _ -> ())
             | "detach" -> ctx.function_usage.uses_detach <- true
             | "daemon" -> ctx.function_usage.uses_daemon <- true
             | "exec" -> 
@@ -1892,28 +1897,32 @@ let rec generate_c_instruction_from_ir ctx instruction =
              | "attach" ->
                  (* Special handling for attach: now takes program handle (not program name) *)
                  ctx.function_usage.uses_attach <- true;
-                 (match c_args with
-                  | [program_handle; target; flags] ->
-                      (* KernelScript uses "category/name" format for tracepoints, convert to libbpf "category:name" format *)
-                      let normalized_target = 
-                        if String.contains target '/' then
-                          (* Convert KernelScript "sched/sched_switch" to libbpf "sched:sched_switch" *)
-                          String.map (function '/' -> ':' | c -> c) target
-                        else
-                          (* For non-tracepoint targets (XDP interfaces, kprobe functions, raw tracepoints), use as-is *)
-                          target
-                      in
-                      (* Use the program handle variable directly instead of extracting program name *)
-                      ("attach_bpf_program_by_fd", [program_handle; normalized_target; flags])
-                  | _ -> failwith "attach expects exactly three arguments")
-             | "attach_perf" ->
-                 (* attach_perf(handle, attr): translate to attach_perf_by_attr(handle, attr) *)
-                 ctx.function_usage.uses_attach_perf <- true;
-                 ctx.function_usage.uses_load <- true;  (* also needs skeleton *)
-                 (match c_args with
-                  | [program_handle; attr_val] ->
-                      ("attach_perf_by_attr", [program_handle; attr_val])
-                  | _ -> failwith "attach_perf expects exactly two arguments (handle, attr)")
+                 (* Detect perf_event form: attach(handle, perf_event_attr) *)
+                 (match args with
+                  | [_; attr_val] when (match attr_val.val_type with IRStruct ("perf_event_attr", _) -> true | _ -> false) ->
+                      (* Perf event form: route to attach_perf_by_attr *)
+                      ctx.function_usage.uses_attach_perf <- true;
+                      ctx.function_usage.uses_load <- true;
+                      (match c_args with
+                       | [program_handle; attr_arg] ->
+                           ("attach_perf_by_attr", [program_handle; attr_arg])
+                       | _ -> failwith "attach with perf_event_attr expects exactly two arguments")
+                  | _ ->
+                      (* Standard form: attach(handle, target, flags) *)
+                      (match c_args with
+                       | [program_handle; target; flags] ->
+                           (* KernelScript uses "category/name" format for tracepoints, convert to libbpf "category:name" format *)
+                           let normalized_target = 
+                             if String.contains target '/' then
+                               (* Convert KernelScript "sched/sched_switch" to libbpf "sched:sched_switch" *)
+                               String.map (function '/' -> ':' | c -> c) target
+                             else
+                               (* For non-tracepoint targets (XDP interfaces, kprobe functions, raw tracepoints), use as-is *)
+                               target
+                           in
+                           (* Use the program handle variable directly instead of extracting program name *)
+                           ("attach_bpf_program_by_fd", [program_handle; normalized_target; flags])
+                       | _ -> failwith "attach expects exactly three arguments (handle, target, flags)"))
              | "detach" ->
                  (* Special handling for detach: takes only program handle *)
                  ctx.function_usage.uses_detach <- true;

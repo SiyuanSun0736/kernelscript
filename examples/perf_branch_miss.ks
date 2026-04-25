@@ -21,7 +21,7 @@ fn main() -> i32 {
     }
 
     var prog = load(on_branch_miss)
-    attach_perf(prog, attr)
+    attach(prog, attr)
     detach(prog)
 
     return 0
