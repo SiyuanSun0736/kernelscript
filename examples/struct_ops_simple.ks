@@ -12,6 +12,10 @@ impl minimal_congestion_control {
         return 16
     }
 
+    fn undo_cwnd(sk: *u8) -> u32 {
+        return ssthresh(sk)
+    }
+
     fn cong_avoid(sk: *u8, ack: u32, acked: u32) -> void {
         // Minimal TCP congestion avoidance implementation
         // In a real implementation, this would adjust the congestion window
