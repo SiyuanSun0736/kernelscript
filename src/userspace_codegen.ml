@@ -4517,7 +4517,7 @@ static void handle_signal(int sig) {
 %s
 
 %s
-|} includes string_typedefs unified_declarations string_helpers daemon_globals "" structs_with_pinned skeleton_code all_fd_declarations map_operation_functions ringbuf_handlers ringbuf_dispatch_functions auto_bpf_init_code getopt_parsing_code bpf_helper_functions (struct_ops_runtime_helpers ^ (if struct_ops_runtime_helpers <> "" && struct_ops_attach_functions <> "" then "\n\n" else "") ^ struct_ops_attach_functions) functions
+|} includes string_typedefs unified_declarations string_helpers daemon_globals "" structs_with_pinned skeleton_code all_fd_declarations map_operation_functions ringbuf_handlers ringbuf_dispatch_functions bpf_helper_functions getopt_parsing_code auto_bpf_init_code (struct_ops_runtime_helpers ^ (if struct_ops_runtime_helpers <> "" && struct_ops_attach_functions <> "" then "\n\n" else "") ^ struct_ops_attach_functions) functions
 
 (** Generate userspace C code from IR multi-program *)
 let generate_userspace_code_from_ir ?(config_declarations = []) ?(tail_call_analysis = {Tail_call_analyzer.dependencies = []; prog_array_size = 0; index_mapping = Hashtbl.create 16; errors = []}) ?(kfunc_dependencies = {kfunc_definitions = []; private_functions = []; program_dependencies = []; module_name = ""}) ?(resolved_imports = []) (ir_multi_prog : ir_multi_program) ?(output_dir = ".") source_filename =
