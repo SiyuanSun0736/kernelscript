@@ -331,7 +331,49 @@ let test_userspace_struct_ops_codegen () =
   
   (* Check that struct_ops setup is included *)
   check bool "Contains struct_ops setup" true
-    (try ignore (Str.search_forward (Str.regexp "MyTcpCong") userspace_code 0); true with Not_found -> false)
+    (try ignore (Str.search_forward (Str.regexp "MyTcpCong") userspace_code 0); true with Not_found -> false);
+
+  check bool "Contains memlock helper for struct_ops" true
+    (contains_substr userspace_code "static int bump_memlock_rlimit(void)");
+
+  check bool "Contains privilege helper for struct_ops" true
+    (contains_substr userspace_code "static int ensure_struct_ops_privileges(void)");
+
+  check bool "Main calls struct_ops runtime checks" true
+    (contains_substr userspace_code "if (bump_memlock_rlimit() < 0)" &&
+     contains_substr userspace_code "if (ensure_struct_ops_privileges() < 0)");
+
+  check bool "Contains struct_ops link global" true
+    (contains_substr userspace_code "static struct bpf_link *MyTcpCong_link = NULL;");
+
+  check bool "Contains struct_ops cleanup helper" true
+    (contains_substr userspace_code "static void cleanup_test(void)");
+
+  check bool "Contains wait helper for struct_ops" true
+    (contains_substr userspace_code "static void wait_for_unregister_request(void)");
+
+  check bool "Contains real attach helper for struct_ops" true
+    (contains_substr userspace_code "int attach_struct_ops_MyTcpCong(void)" &&
+     contains_substr userspace_code "MyTcpCong_link = bpf_map__attach_struct_ops(map);");
+
+  check bool "Contains real detach helper for struct_ops" true
+    (contains_substr userspace_code "int detach_struct_ops_MyTcpCong(void)" &&
+     contains_substr userspace_code "bpf_link__destroy(MyTcpCong_link);");
+
+  check bool "register() uses attach helper" true
+    (contains_substr userspace_code "attach_struct_ops_MyTcpCong()");
+
+  check bool "Struct_ops load failure includes EPERM hint" true
+    (contains_substr userspace_code "The kernel rejected BPF loading with EPERM. Make sure you run as root and the kernel supports struct_ops.");
+
+  check bool "Main waits for unregister request" true
+    (contains_substr userspace_code "wait_for_unregister_request();");
+
+  check bool "Main detaches struct_ops before exit" true
+    (contains_substr userspace_code "detach_struct_ops_MyTcpCong();");
+
+  check bool "Main registers struct_ops cleanup" true
+    (contains_substr userspace_code "atexit(cleanup_test);")
 
 (** Test that malformed struct_ops attributes are parsed but should be caught *)
 let test_malformed_struct_ops_attribute () =
@@ -837,7 +879,7 @@ let test_selective_struct_inclusion_in_ebpf () =
 let test_struct_ops_compilation_completeness () =
   let program = {|
     @struct_ops("tcp_congestion_ops")
-    impl MinimalCongestion {
+  impl minimal_congestion_control {
         fn ssthresh(sk: *u8) -> u32 {
             return 16
         }
@@ -845,8 +887,7 @@ let test_struct_ops_compilation_completeness () =
         fn cong_avoid(sk: *u8, ack: u32, acked: u32) -> void {
             // Implementation
         }
-        
-        name: "minimal_cc",
+
         owner: null,
     }
     
@@ -855,7 +896,7 @@ let test_struct_ops_compilation_completeness () =
     }
     
     fn main() -> i32 {
-        var result = register(MinimalCongestion)
+      var result = register(minimal_congestion_control)
         return result
     }
   |} in
@@ -875,15 +916,123 @@ let test_struct_ops_compilation_completeness () =
   
   (* Check that the struct_ops instance can be instantiated (key thing that was failing) *)
   check bool "Contains struct_ops instance instantiation" true
-    (contains_substr c_code "MinimalCongestion" && contains_substr c_code "struct tcp_congestion_ops");
+    (contains_substr c_code "minimal_congestion_control" && contains_substr c_code "struct tcp_congestion_ops");
   
   (* Verify SEC annotations are present *)
   check bool "Contains .struct_ops section" true
     (contains_substr c_code "SEC(\".struct_ops\")");
+
+  (* Verify the compiler synthesizes a safe default name when omitted *)
+  check bool "Contains synthesized tcp_congestion_ops name" true
+    (contains_substr c_code ".name = \"minimal_cc\"");
   
   (* Verify individual function SEC annotations *)
   check bool "Contains struct_ops function sections" true
     (contains_substr c_code "SEC(\"struct_ops/")
+
+(** Test struct_ops internal calls stay as direct calls instead of tail calls *)
+let test_struct_ops_internal_calls_are_direct () =
+  let program = {|
+    @struct_ops("tcp_congestion_ops")
+    impl minimal_congestion_control {
+        fn ssthresh(sk: *u8) -> u32 {
+            return 16
+        }
+
+        fn undo_cwnd(sk: *u8) -> u32 {
+            return ssthresh(sk)
+        }
+    }
+  |} in
+
+  let ast = Parse.parse_string program in
+  let ast_with_structs = ast @ Test_utils.StructOps.builtin_ast in
+  let symbol_table = Symbol_table.build_symbol_table ast_with_structs in
+  let (typed_ast, _) = Type_checker.type_check_and_annotate_ast ast_with_structs in
+  let ir = Ir_generator.generate_ir typed_ast symbol_table "test" in
+  let (c_code, _) = Ebpf_c_codegen.compile_multi_to_c_with_analysis ir in
+
+  check bool "struct_ops direct call emitted" true
+    (contains_substr c_code "ssthresh(sk)");
+  check bool "struct_ops tail call not emitted" false
+    (contains_substr c_code "bpf_tail_call(ctx, &prog_array")
+
+(** Test that find_struct_ops_main_registration correctly identifies the
+    attach result variable, the struct_ops instance, and the terminal return
+    variable even when the returned variable name differs from the register()
+    result (e.g. an alias is assigned before the final return).
+
+    The generated lifecycle code must use the C names produced by
+    generate_c_value_from_ir, not the raw IR names, so that the emitted
+    code refers to var_result instead of the un-prefixed result and avoids
+    the "undeclared identifier" error that motivated this function. *)
+let test_find_struct_ops_main_registration () =
+  (* Simple case: var result = register(MyTcpCong); return result *)
+  let program_simple = {|
+    @struct_ops("tcp_congestion_ops")
+    impl MyTcpCong {
+        fn init(sk: *u8) -> u32 { return 0 }
+        fn release(sk: *u8) -> void {}
+        name: "my_tcp_cong",
+        owner: null,
+    }
+    fn main() -> i32 {
+        var result = register(MyTcpCong)
+        return result
+    }
+  |} in
+  let ast = Parse.parse_string program_simple in
+  let symbol_table = Symbol_table.build_symbol_table ast in
+  let (typed_ast, _) = Type_checker.type_check_and_annotate_ast ast in
+  let ir = Ir_generator.generate_ir typed_ast symbol_table "test" in
+  let userspace_code = match ir.userspace_program with
+    | Some p -> Userspace_codegen.generate_complete_userspace_program_from_ir
+                  p (Ir.get_global_maps ir) ir "test"
+    | None -> ""
+  in
+  (* The lifecycle code should use the correctly-prefixed C variable throughout *)
+  check bool "lifecycle uses var_result for attach status check" true
+    (contains_substr userspace_code "if (var_result != 0)");
+  check bool "lifecycle calls detach_struct_ops_MyTcpCong" true
+    (contains_substr userspace_code "var_result = detach_struct_ops_MyTcpCong()");
+  check bool "lifecycle returns var_result at the end" true
+    (contains_substr userspace_code "return var_result;");
+  check bool "register result stored via prefixed var_result, not bare result" true
+    (* The register() result must be stored into var_result (with the var_ prefix)
+       not the bare IR name 'result', to avoid an undeclared-identifier compile error. *)
+    (contains_substr userspace_code "var_result = __struct_ops_reg");
+
+  (* Alias case: var result = register(MyTcpCong); var code = result; return code
+     The terminal_return_value must track the alias, not the register result. *)
+  let program_alias = {|
+    @struct_ops("tcp_congestion_ops")
+    impl MyTcpCong {
+        fn init(sk: *u8) -> u32 { return 0 }
+        fn release(sk: *u8) -> void {}
+        name: "my_tcp_cong",
+        owner: null,
+    }
+    fn main() -> i32 {
+        var result = register(MyTcpCong)
+        var code = result
+        return code
+    }
+  |} in
+  let ast2 = Parse.parse_string program_alias in
+  let symbol_table2 = Symbol_table.build_symbol_table ast2 in
+  let (typed_ast2, _) = Type_checker.type_check_and_annotate_ast ast2 in
+  let ir2 = Ir_generator.generate_ir typed_ast2 symbol_table2 "test" in
+  let userspace_code2 = match ir2.userspace_program with
+    | Some p -> Userspace_codegen.generate_complete_userspace_program_from_ir
+                  p (Ir.get_global_maps ir2) ir2 "test"
+    | None -> ""
+  in
+  (* When the terminal variable is an alias, the lifecycle return must use that
+     alias variable, not the original register result variable. *)
+  check bool "alias case: lifecycle returns the alias variable" true
+    (contains_substr userspace_code2 "return var_code;" ||
+     (* If the compiler folds the alias away, returning var_result is also fine *)
+     contains_substr userspace_code2 "return var_result;")
 
 (** NEW: Test struct inclusion logic with mixed struct types *)
 let test_mixed_struct_types_inclusion () =
@@ -1247,6 +1396,8 @@ let tests = [
   (* NEW: Regression tests for struct inclusion bugs *)
   "selective struct inclusion in eBPF", `Quick, test_selective_struct_inclusion_in_ebpf;
   "struct_ops compilation completeness", `Quick, test_struct_ops_compilation_completeness;
+  "struct_ops internal direct calls", `Quick, test_struct_ops_internal_calls_are_direct;
+  "find_struct_ops_main_registration", `Quick, test_find_struct_ops_main_registration;
   "mixed struct types inclusion", `Quick, test_mixed_struct_types_inclusion;
   "malformed struct_ops attribute", `Quick, test_malformed_struct_ops_attribute;
   "register() with non-struct", `Quick, test_register_with_non_struct;
