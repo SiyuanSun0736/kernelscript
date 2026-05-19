@@ -580,6 +580,11 @@ fn main() -> i32 {
     var details = read_details(cache)
     var snapshot = read_group(cache)
     print("raw=%lld scaled=%lld group=%u", raw, details.scaled, snapshot.count)
+    var i = 0
+    while (i < snapshot.count) {
+        print("id=%llu value=%lld", snapshot.ids[i], snapshot.values[i])
+        i = i + 1
+    }
     detach(branch)
     detach(cache)
     detach(prog)
@@ -599,6 +604,11 @@ fn main() -> i32 {
     (contains_substr code "PERF_FORMAT_ID" && contains_substr code "PERF_FORMAT_GROUP");
   check bool "group values are multiplex scaled" true
     (contains_substr code "ks_scale_perf_count(group.values[i].value")
+  ;
+  check bool "array field snapshots are copied before indexing" true
+    (contains_substr code "memcpy(__field_access_");
+  check bool "array snapshot indexing dereferences element pointer" true
+    (contains_substr code "*__array_ptr_")
 
 let test_perf_group_too_large_static_group_rejected () =
   Unix.putenv "KERNELSCRIPT_PERF_GROUP_MAX_EVENTS" "4";

@@ -877,7 +877,7 @@ let rec lower_expression ctx (expr : Ast.expr) =
                 emit_variable_decl_val ctx ptr_val ptr_val.val_type (Some ptr_expr) expr.expr_pos;
                 
                 (* result = *ptr *)
-                let load_expr = make_ir_expr (IRValue ptr_val) element_type expr.expr_pos in
+                let load_expr = make_ir_expr (IRUnOp (IRDeref, ptr_val)) element_type expr.expr_pos in
                 emit_variable_decl_val ctx result_val element_type (Some load_expr) expr.expr_pos);
            
            result_val)

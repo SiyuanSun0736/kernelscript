@@ -357,6 +357,37 @@ fn main() -> i32 {
   with
   | exn -> fail ("Test failed with exception: " ^ Printexc.to_string exn)
 
+(** Test 9: A later variable declaration with the same name as a for counter
+    should own the declaration instead of producing a duplicate function-scope
+    predeclaration. *)
+let test_for_counter_reused_by_later_var_decl () =
+  let program_text = {|
+@xdp fn test(ctx: *xdp_md) -> xdp_action {
+  return 2
+}
+
+fn main() -> i32 {
+  var total = 0
+  for (i in 0..3) {
+    total = total + i
+  }
+  var i = 0
+  while (i < 2) {
+    i = i + 1
+  }
+  return 0
+}
+|} in
+
+  try
+    let result = generate_userspace_code_from_program program_text "test_for_reuse" in
+    check bool "for loop still generated" true (contains_pattern result "for.*var_i");
+    check bool "later declaration generated once" true (contains_pattern result "uint32_t var_i = 0");
+    check bool "no duplicate predeclaration for reused counter" false
+      (contains_pattern result "uint32_t var_i;[\\s\\S]*uint32_t var_i = 0")
+  with
+  | exn -> fail ("Test failed with exception: " ^ Printexc.to_string exn)
+
 (** All global function for statement codegen tests *)
 let global_function_for_codegen_tests = [
   "basic_for_loop_constant_bounds", `Quick, test_basic_for_loop_constant_bounds;
@@ -367,6 +398,7 @@ let global_function_for_codegen_tests = [
   "for_loop_zero_iterations", `Quick, test_for_loop_zero_iterations;
   "for_loop_in_helper_function", `Quick, test_for_loop_in_helper_function;
   "global_functions_vs_ebpf_differences", `Quick, test_global_functions_vs_ebpf_for_loop_differences;
+  "for_counter_reused_by_later_var_decl", `Quick, test_for_counter_reused_by_later_var_decl;
 ]
 
 let () =

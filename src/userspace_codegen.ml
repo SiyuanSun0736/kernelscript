@@ -1895,7 +1895,11 @@ let rec generate_c_instruction_from_ir ctx instruction =
            (match init_expr_opt with
             | Some init_expr ->
                 let init_str = generate_c_expression_from_ir ctx init_expr in
-                sprintf "%s = %s;" array_decl init_str
+                (match init_expr.expr_desc with
+                 | IRValue { value_desc = IRLiteral (ArrayLit _); _ } ->
+                     sprintf "%s = %s;" array_decl init_str
+                 | _ ->
+                     sprintf "%s;\n    memcpy(%s, %s, sizeof(%s));" array_decl c_var_name init_str c_var_name)
             | None ->
                 sprintf "%s;" array_decl)
        | _ ->
@@ -2394,8 +2398,33 @@ let collect_undeclared_variables_in_function ir_func =
     | _ -> ()
   in
 
+  let rec collect_declared_from_instr ir_instr =
+    collect_declared_vars ir_instr;
+    match ir_instr.instr_desc with
+    | IRIf (_, then_instrs, else_instrs_opt) ->
+        List.iter collect_declared_from_instr then_instrs;
+        (match else_instrs_opt with
+         | Some else_instrs -> List.iter collect_declared_from_instr else_instrs
+         | None -> ())
+    | IRIfElseChain (conditions_and_bodies, final_else) ->
+        List.iter (fun (_, instrs) ->
+          List.iter collect_declared_from_instr instrs
+        ) conditions_and_bodies;
+        (match final_else with
+         | Some instrs -> List.iter collect_declared_from_instr instrs
+         | None -> ())
+    | IRBpfLoop (_, _, _, _, body_instructions) ->
+        List.iter collect_declared_from_instr body_instructions
+    | IRTry (try_instrs, catch_clauses) ->
+        List.iter collect_declared_from_instr try_instrs;
+        List.iter (fun clause ->
+          List.iter collect_declared_from_instr clause.catch_body
+        ) catch_clauses
+    | _ -> ()
+  in
+
   let collect_declared_from_instrs instrs =
-    List.iter collect_declared_vars instrs
+    List.iter collect_declared_from_instr instrs
   in
   
   List.iter (fun block ->
@@ -2614,6 +2643,10 @@ let generate_c_function_from_ir ?(global_variables = []) ?(base_name = "") ?(con
   let rec collect_declared_vars ir_instr =
     match ir_instr.instr_desc with
     | IRVariableDecl (dest_val, _, _) ->
+        (match dest_val.value_desc with
+         | IRVariable var_name | IRTempVariable var_name ->
+             Hashtbl.replace ctx.declared_via_ir var_name ()
+         | _ -> ());
         (* Only user variables (IRVariable) need var_ prefix, not compiler temps (IRTempVariable) *)
         (match dest_val.value_desc with
          | IRVariable var_name ->

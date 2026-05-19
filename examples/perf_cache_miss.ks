@@ -22,8 +22,34 @@ fn main() -> i32 {
     print("Cache-miss count: %lld", cache_count)
     var branch_count = read(branch)
     print("Branch-miss count: %lld", branch_count)
+    
+    var prev = read_details(cache)
+    // Simulate workload with cache misses and branch misses.
+    var x = 0
+    var i = 0
+    for (i in 0..10000000) {
+        if (i % 100 == 0) {
+            x = x + 1
+        } else {
+            x = x * 2
+        }
+    }
+    var cur = read_details(cache)
+    var delta = cur.scaled - prev.scaled
+    var dt_ns = cur.time_enabled - prev.time_enabled
+    if (dt_ns > 0) {
+        var per_sec = (delta * 1000000000) / dt_ns
+        print("Cache misses/sec: %lld", per_sec)
+    }
+
     var snapshot = read_group(cache)
     print("Grouped snapshot entries: %u", snapshot.count)
+
+    var snapshot_index = 0
+    while (snapshot_index < snapshot.count) {
+        print("id=%llu value=%lld", snapshot.ids[snapshot_index], snapshot.values[snapshot_index])
+        snapshot_index = snapshot_index + 1
+    }
 
     detach(branch)
     detach(cache)
