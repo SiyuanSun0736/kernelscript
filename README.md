@@ -306,7 +306,7 @@ fn on_branch_miss(ctx: *bpf_perf_event_data) -> i32 {
 fn main() -> i32 {
     var prog = load(on_branch_miss)
 
-    // Minimal form — defaults: pid=-1 (all procs), cpu=0, group_fd=-1,
+    // Minimal form — defaults: pid=-1 (all procs), cpu=0, no group,
     // period=1_000_000, wakeup=1; perf attach flags must be 0
     var att = attach(prog, perf_options { perf_type: perf_type_hardware, perf_config: branch_misses }, 0)
     var count = read(att)
@@ -318,18 +318,21 @@ fn main() -> i32 {
 }
 ```
 
-Perf events can share a kernel scheduling group by passing the leader attachment's `perf_fd` as `group_fd`:
+Perf events can share a kernel scheduling group by passing the leader attachment directly with `group`.
+The lower-level `group_fd: cache.perf_fd` form is still supported for compatibility:
 
 ```kernelscript
 var cache = attach(prog, perf_options { perf_type: perf_type_hardware, perf_config: cache_misses }, 0)
 var branch = attach(prog, perf_options {
     perf_type: perf_type_hardware,
     perf_config: branch_misses,
-    group_fd: cache.perf_fd,
+    group: cache,
 }, 0)
 ```
 
-Adding a member restarts the whole group from zero. Detach members before detaching their leader. `read(att)` still reads one attachment at a time; it returns a multiplex-scaled count when the kernel reports `time_running < time_enabled`. Group snapshot reads are not part of this first-stage API.
+Adding a member restarts the whole group from zero. Detaching a leader cascades to any live members. A group competes for PMU counters as one atomic unit: different groups can be multiplexed over time, but members inside one group are not independently multiplexed. For statically visible groups, the compiler rejects groups that need more PMU counter slots than the target limit. The limit is read from known sysfs PMU caps when available, defaults to 4, and can be overridden with `KERNELSCRIPT_PERF_GROUP_MAX_EVENTS`.
+
+`read(att)` returns a multiplex-scaled count when the kernel reports `time_running < time_enabled`. Use `read_raw(att)` for the raw value, `read_details(att)` for raw/scaled/timing details, and `read_group(leader)` for a same-time group snapshot.
 
 **Available `perf_type` values:**
 

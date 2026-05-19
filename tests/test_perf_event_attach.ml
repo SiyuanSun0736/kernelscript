@@ -255,12 +255,15 @@ let test_perf_event_group_fd_codegen () =
   check bool "perf_event_open no longer hardcodes no group" false
     (contains_substr code "pid, cpu, -1, PERF_FLAG_FD_CLOEXEC");
   check bool "read_format requests multiplex timing" true
-    (contains_substr code "PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING")
+    (contains_substr code "PERF_FORMAT_TOTAL_TIME_ENABLED" &&
+     contains_substr code "PERF_FORMAT_TOTAL_TIME_RUNNING");
+  check bool "group snapshot format omitted until read_group is used" false
+    (contains_substr code "PERF_FORMAT_GROUP")
 
 let test_perf_event_group_member_lifecycle_codegen () =
   let code = make_perf_code_with ~period:1000000L ~wakeup:1L in
   check bool "member branch detected from group_fd" true
-    (contains_substr code "bool is_group_member = opts.group_fd >= 0;");
+    (contains_substr code "bool is_group_member = effective_group_fd >= 0;");
   check bool "group restart helper emitted" true
     (contains_substr code "static int ks_restart_perf_group(int group_fd)");
   check bool "group disable uses PERF_IOC_FLAG_GROUP" true
@@ -272,9 +275,9 @@ let test_perf_event_group_member_lifecycle_codegen () =
   check bool "member restart happens after link attach" true
     (appears_before code
        "bpf_program__attach_perf_event(prog, perf_fd)"
-       "ks_restart_perf_group(opts.group_fd)");
+       "ks_restart_perf_group(effective_group_fd)");
   check bool "attachment stores group metadata" true
-    (contains_substr code "opts.group_fd, is_group_member ? 1 : 0")
+    (contains_substr code "effective_group_fd, is_group_member ? 1 : 0")
 
 let test_standard_attach_uses_libbpf_error_checks () =
   let prog_handle = make_ir_value (IRVariable "prog") IRI32 test_pos in
@@ -390,13 +393,13 @@ let test_perf_read_helper_scales_multiplexed_counts () =
   check bool "read helper includes time_running" true
     (contains_substr code "uint64_t time_running;");
   check bool "time_running zero guard emitted" true
-    (contains_substr code "if (count.time_running == 0)");
+    (contains_substr code "if (time_running == 0)");
   check bool "fast path returns raw value" true
-    (contains_substr code "if (count.time_enabled == count.time_running)");
+    (contains_substr code "if (time_enabled == time_running)");
   check bool "scaled path uses 128-bit intermediate" true
     (contains_substr code "__uint128_t scaled");
   check bool "scaled path multiplies by time_enabled" true
-    (contains_substr code "count.value * (__uint128_t)count.time_enabled")
+    (contains_substr code "value * (__uint128_t)time_enabled")
 
 let test_perf_attach_event_function_generated () =
   (* attach(prog, perf_options{...}, 0) must generate ks_attach_perf_event which
@@ -520,8 +523,135 @@ fn main() -> i32 {
     (contains_substr code ".group_fd = __field_access_");
   check bool "leader detach protection helper generated" true
     (contains_substr code "perf_group_has_active_members_locked");
-  check bool "detach rejects active group leaders" true
-    (contains_substr code "Cannot detach perf group leader fd %d while active members exist")
+  check bool "detach cascades active group leaders" true
+    (contains_substr code "Detaching perf group leader fd %d cascades to %d active member(s)")
+
+let test_perf_group_attachment_field_codegen () =
+  let source = {|
+@perf_event
+fn on_event(ctx: *bpf_perf_event_data) -> i32 {
+    return 0
+}
+
+fn main() -> i32 {
+    var prog = load(on_event)
+    var cache = attach(prog, perf_options {
+        perf_type: perf_type_hardware,
+        perf_config: cache_misses,
+    }, 0)
+    var branch = attach(prog, perf_options {
+        perf_type: perf_type_hardware,
+        perf_config: branch_misses,
+        group: cache,
+    }, 0)
+    detach(branch)
+    detach(cache)
+    detach(prog)
+    return 0
+}
+|} in
+  let code = make_generated_code_from_source source in
+  check bool "perf_options carries high-level group attachment" true
+    (contains_substr code "PerfAttachment group;");
+  check bool "source group attachment field type-checks and codegens" true
+    (contains_substr code ".group = var_cache");
+  check bool "runtime prefers valid group attachment fd" true
+    (contains_substr code "opts.group.perf_fd >= 0 && opts.group.link_id > 0 && opts.group.generation != 0")
+
+let test_perf_read_raw_details_and_group_codegen () =
+  let source = {|
+@perf_event
+fn on_event(ctx: *bpf_perf_event_data) -> i32 {
+    return 0
+}
+
+fn main() -> i32 {
+    var prog = load(on_event)
+    var cache = attach(prog, perf_options {
+        perf_type: perf_type_hardware,
+        perf_config: cache_misses,
+    }, 0)
+    var branch = attach(prog, perf_options {
+        perf_type: perf_type_hardware,
+        perf_config: branch_misses,
+        group: cache,
+    }, 0)
+    var raw = read_raw(cache)
+    var details = read_details(cache)
+    var snapshot = read_group(cache)
+    print("raw=%lld scaled=%lld group=%u", raw, details.scaled, snapshot.count)
+    detach(branch)
+    detach(cache)
+    detach(prog)
+    return 0
+}
+|} in
+  let code = make_generated_code_from_source source in
+  check bool "raw read helper generated" true
+    (contains_substr code "ks_perf_attachment_read_raw");
+  check bool "details read helper generated" true
+    (contains_substr code "PerfReadDetails ks_perf_attachment_read_details");
+  check bool "group read helper generated" true
+    (contains_substr code "PerfGroupRead ks_perf_attachment_read_group");
+  check bool "group snapshot buffer generated" true
+    (contains_substr code "struct ks_perf_group_read_buffer");
+  check bool "read_group enables group read format" true
+    (contains_substr code "PERF_FORMAT_ID" && contains_substr code "PERF_FORMAT_GROUP");
+  check bool "group values are multiplex scaled" true
+    (contains_substr code "ks_scale_perf_count(group.values[i].value")
+
+let test_perf_group_too_large_static_group_rejected () =
+  Unix.putenv "KERNELSCRIPT_PERF_GROUP_MAX_EVENTS" "4";
+  let source = {|
+@perf_event
+fn on_event(ctx: *bpf_perf_event_data) -> i32 {
+    return 0
+}
+
+fn main() -> i32 {
+    var prog = load(on_event)
+    var cache = attach(prog, perf_options {
+        perf_type: perf_type_hardware,
+        perf_config: cache_misses,
+    }, 0)
+    var branch = attach(prog, perf_options {
+        perf_type: perf_type_hardware,
+        perf_config: branch_misses,
+        group: cache,
+    }, 0)
+    var cycles = attach(prog, perf_options {
+        perf_type: perf_type_hardware,
+        perf_config: cpu_cycles,
+        group: cache,
+    }, 0)
+    var inst = attach(prog, perf_options {
+        perf_type: perf_type_hardware,
+        perf_config: instructions,
+        group: cache,
+    }, 0)
+    var refs = attach(prog, perf_options {
+        perf_type: perf_type_hardware,
+        perf_config: cache_references,
+        group: cache,
+    }, 0)
+    detach(refs)
+    detach(inst)
+    detach(cycles)
+    detach(branch)
+    detach(cache)
+    detach(prog)
+    return 0
+}
+|} in
+  try
+    let _ = make_generated_code_from_source source in
+    fail "Oversized static perf event group should be rejected at compile time"
+  with
+  | Type_error (msg, _) ->
+      check bool "oversized group reports PMU group limit" true
+        (contains_substr msg "perf event group rooted at 'cache' needs 5 PMU counter slot(s), but target PMU group limit is 4")
+  | exn ->
+      fail ("Expected Type_error for oversized perf event group, got " ^ Printexc.to_string exn)
 
 (* ── Type-checking regression tests ───────────────────────────────────── *)
 
@@ -599,6 +729,9 @@ let tests = [
   test_case "perf_attach_event_function_generated"      `Quick test_perf_attach_event_function_generated;
   test_case "detach_attach_concurrent_window"           `Quick test_detach_attach_concurrent_window;
   test_case "perf_group_source_field_access_codegen"    `Quick test_perf_group_source_field_access_codegen;
+  test_case "perf_group_attachment_field_codegen"       `Quick test_perf_group_attachment_field_codegen;
+  test_case "perf_read_raw_details_and_group_codegen"   `Quick test_perf_read_raw_details_and_group_codegen;
+  test_case "perf_group_too_large_static_group_rejected" `Quick test_perf_group_too_large_static_group_rejected;
   test_case "standard_attach_uses_libbpf_error_checks"  `Quick test_standard_attach_uses_libbpf_error_checks;
 ]
 

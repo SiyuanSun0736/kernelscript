@@ -129,6 +129,13 @@ let validate_read_function arg_types _ast_context _pos =
   | _ ->
       (false, Some "read() currently requires a PerfAttachment")
 
+let validate_read_group_function arg_types _ast_context _pos =
+  match arg_types with
+  | [Struct "PerfAttachment"] | [UserType "PerfAttachment"] ->
+      (true, None)
+  | _ ->
+      (false, Some "read_group() requires a PerfAttachment group leader")
+
 (** Validation function for detach() - accepts program handles and perf attachments *)
 let validate_detach_function arg_types _ast_context _pos =
   match arg_types with
@@ -244,12 +251,45 @@ let builtin_functions = [
     name = "read";
     param_types = []; (* Custom validation handles attachment-aware overloads *)
     return_type = I64; (* Raw counter value, or -1 on error *)
-    description = "Read the current hardware/software counter value for a perf attachment";
+    description = "Read the multiplex-scaled hardware/software counter value for a perf attachment";
     is_variadic = false;
     ebpf_impl = ""; (* Not available in eBPF context *)
     userspace_impl = "ks_perf_attachment_read";
     kernel_impl = "";
     validate = Some validate_read_function;
+  };
+  {
+    name = "read_raw";
+    param_types = [];
+    return_type = I64;
+    description = "Read the raw hardware/software counter value for a perf attachment";
+    is_variadic = false;
+    ebpf_impl = "";
+    userspace_impl = "ks_perf_attachment_read_raw";
+    kernel_impl = "";
+    validate = Some validate_read_function;
+  };
+  {
+    name = "read_details";
+    param_types = [];
+    return_type = Struct "PerfReadDetails";
+    description = "Read raw, scaled, time_enabled, and time_running for a perf attachment";
+    is_variadic = false;
+    ebpf_impl = "";
+    userspace_impl = "ks_perf_attachment_read_details";
+    kernel_impl = "";
+    validate = Some validate_read_function;
+  };
+  {
+    name = "read_group";
+    param_types = [];
+    return_type = Struct "PerfGroupRead";
+    description = "Read a same-time snapshot from a perf event group leader";
+    is_variadic = false;
+    ebpf_impl = "";
+    userspace_impl = "ks_perf_attachment_read_group";
+    kernel_impl = "";
+    validate = Some validate_read_group_function;
   };
 ]
 
@@ -350,6 +390,7 @@ let builtin_types = [
     ("pid",            I32);
     ("cpu",            I32);
     ("group_fd",       I32);
+    ("group",          Struct "PerfAttachment");
     ("period",         U64);
     ("wakeup",         U32);
     ("inherit",        Bool);
@@ -364,6 +405,21 @@ let builtin_types = [
     ("prog_fd", I32);
     ("generation", U64);
   ], builtin_pos));
+
+  TypeDef (StructDef ("PerfReadDetails", [
+    ("raw", I64);
+    ("scaled", I64);
+    ("time_enabled", U64);
+    ("time_running", U64);
+  ], builtin_pos));
+
+  TypeDef (StructDef ("PerfGroupRead", [
+    ("count", U32);
+    ("values", Array (I64, 16));
+    ("ids", Array (U64, 16));
+    ("time_enabled", U64);
+    ("time_running", U64);
+  ], builtin_pos));
 ]
 
 (** Default field values for structs that support partial initialisation.
@@ -373,14 +429,20 @@ let builtin_types = [
 let get_struct_field_defaults = function
   | "perf_options" ->
       Some [
-        ("pid",            IntLit (Signed64 (-1L),      None));
-        ("cpu",            IntLit (Signed64 0L,         None));
-        ("group_fd",       IntLit (Signed64 (-1L),      None));
-        ("period",         IntLit (Unsigned64 1000000L, None));
-        ("wakeup",         IntLit (Unsigned64 1L,       None));
-        ("inherit",        BoolLit false);
-        ("exclude_kernel", BoolLit false);
-        ("exclude_user",   BoolLit false);
+        ("pid",            Literal (IntLit (Signed64 (-1L),      None)));
+        ("cpu",            Literal (IntLit (Signed64 0L,         None)));
+        ("group_fd",       Literal (IntLit (Signed64 (-1L),      None)));
+        ("group",          StructLiteral ("PerfAttachment", [
+          ("perf_fd",    make_expr (Literal (IntLit (Signed64 (-1L), None))) builtin_pos);
+          ("link_id",    make_expr (Literal (IntLit (Signed64 (-1L), None))) builtin_pos);
+          ("prog_fd",    make_expr (Literal (IntLit (Signed64 (-1L), None))) builtin_pos);
+          ("generation", make_expr (Literal (IntLit (Unsigned64 0L,  None))) builtin_pos);
+        ]));
+        ("period",         Literal (IntLit (Unsigned64 1000000L, None)));
+        ("wakeup",         Literal (IntLit (Unsigned64 1L,       None)));
+        ("inherit",        Literal (BoolLit false));
+        ("exclude_kernel", Literal (BoolLit false));
+        ("exclude_user",   Literal (BoolLit false));
       ]
   | _ -> None
 

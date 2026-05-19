@@ -419,7 +419,7 @@
 (executable
  (name test_perf_event_attach)
  (modules test_perf_event_attach)
- (libraries kernelscript alcotest test_utils str))
+ (libraries kernelscript alcotest test_utils str unix))
 
 (executable
  (name test_tc)

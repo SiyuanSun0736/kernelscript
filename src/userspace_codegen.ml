@@ -384,6 +384,9 @@ type function_usage = {
   mutable uses_attach: bool;
   mutable uses_attach_perf: bool;
   mutable uses_perf_read: bool;
+  mutable uses_perf_read_raw: bool;
+  mutable uses_perf_read_details: bool;
+  mutable uses_perf_read_group: bool;
   mutable uses_detach: bool;
   mutable uses_map_operations: bool;
   mutable uses_daemon: bool;
@@ -397,6 +400,9 @@ let create_function_usage () = {
   uses_attach = false;
   uses_attach_perf = false;
   uses_perf_read = false;
+  uses_perf_read_raw = false;
+  uses_perf_read_details = false;
+  uses_perf_read_group = false;
   uses_detach = false;
   uses_map_operations = false;
   uses_daemon = false;
@@ -715,6 +721,12 @@ let track_function_usage ctx instr =
                      ctx.function_usage.uses_attach <- true)
             | "read" ->
               ctx.function_usage.uses_perf_read <- true
+            | "read_raw" ->
+              ctx.function_usage.uses_perf_read_raw <- true
+            | "read_details" ->
+              ctx.function_usage.uses_perf_read_details <- true
+            | "read_group" ->
+              ctx.function_usage.uses_perf_read_group <- true
             | "detach" -> ctx.function_usage.uses_detach <- true
             | "daemon" -> ctx.function_usage.uses_daemon <- true
             | "exec" -> 
@@ -2034,6 +2046,21 @@ let rec generate_c_instruction_from_ir ctx instruction =
                  (match c_args with
                   | [attachment] -> ("ks_perf_attachment_read", [attachment])
                   | _ -> failwith "read expects exactly one argument")
+             | "read_raw" ->
+                 ctx.function_usage.uses_perf_read_raw <- true;
+                 (match c_args with
+                  | [attachment] -> ("ks_perf_attachment_read_raw", [attachment])
+                  | _ -> failwith "read_raw expects exactly one argument")
+             | "read_details" ->
+                 ctx.function_usage.uses_perf_read_details <- true;
+                 (match c_args with
+                  | [attachment] -> ("ks_perf_attachment_read_details", [attachment])
+                  | _ -> failwith "read_details expects exactly one argument")
+             | "read_group" ->
+                 ctx.function_usage.uses_perf_read_group <- true;
+                 (match c_args with
+                  | [attachment] -> ("ks_perf_attachment_read_group", [attachment])
+                  | _ -> failwith "read_group expects exactly one argument")
              | _ -> (userspace_impl, c_args))
         | None ->
             (* Regular function call *)
@@ -3793,6 +3820,9 @@ let generate_complete_userspace_program_from_ir ?(config_declarations = []) ?(ta
       uses_attach = acc_usage.uses_attach || func_usage.uses_attach;
       uses_attach_perf = acc_usage.uses_attach_perf || func_usage.uses_attach_perf;
       uses_perf_read = acc_usage.uses_perf_read || func_usage.uses_perf_read;
+      uses_perf_read_raw = acc_usage.uses_perf_read_raw || func_usage.uses_perf_read_raw;
+      uses_perf_read_details = acc_usage.uses_perf_read_details || func_usage.uses_perf_read_details;
+      uses_perf_read_group = acc_usage.uses_perf_read_group || func_usage.uses_perf_read_group;
       uses_detach = acc_usage.uses_detach || func_usage.uses_detach;
       uses_map_operations = acc_usage.uses_map_operations || func_usage.uses_map_operations;
       uses_daemon = acc_usage.uses_daemon || func_usage.uses_daemon;
@@ -3828,7 +3858,13 @@ let generate_complete_userspace_program_from_ir ?(config_declarations = []) ?(ta
   (* For header generation, use all global maps if there are pinned maps, otherwise use the filtered list *)
   let maps_for_headers = if has_any_pinned_maps then global_maps else used_global_maps_with_exec in
   
-  let uses_bpf_functions = all_usage.uses_load || all_usage.uses_attach || all_usage.uses_detach || all_usage.uses_attach_perf || all_usage.uses_perf_read in
+  let uses_any_perf_read =
+    all_usage.uses_perf_read ||
+    all_usage.uses_perf_read_raw ||
+    all_usage.uses_perf_read_details ||
+    all_usage.uses_perf_read_group
+  in
+  let uses_bpf_functions = all_usage.uses_load || all_usage.uses_attach || all_usage.uses_detach || all_usage.uses_attach_perf || uses_any_perf_read in
   let base_includes = generate_headers_for_maps ~uses_bpf_functions maps_for_headers in
   let bpf_attach_includes = if uses_bpf_functions then
     "#include <sys/ioctl.h>\n"
@@ -3902,6 +3938,29 @@ typedef enum {
   cpu_migrations = PERF_COUNT_SW_CPU_MIGRATIONS
 } perf_sw_config;
 
+typedef struct PerfAttachment {
+  int perf_fd;
+  int link_id;
+  int prog_fd;
+  uint64_t generation;
+} PerfAttachment;
+
+typedef struct PerfReadDetails {
+  int64_t raw;
+  int64_t scaled;
+  uint64_t time_enabled;
+  uint64_t time_running;
+} PerfReadDetails;
+
+#define KS_PERF_GROUP_MAX_VALUES 16
+typedef struct PerfGroupRead {
+  uint32_t count;
+  int64_t values[KS_PERF_GROUP_MAX_VALUES];
+  uint64_t ids[KS_PERF_GROUP_MAX_VALUES];
+  uint64_t time_enabled;
+  uint64_t time_running;
+} PerfGroupRead;
+
 /* ks_perf_options holds all KernelScript perf_options fields plus the inner
  * kernel perf_event_attr (from linux/perf_event.h) that ks_open_perf_event fills. */
 typedef struct {
@@ -3911,6 +3970,7 @@ typedef struct {
     int32_t pid;                  /* process ID (-1 = all processes, default) */
     int32_t cpu;                  /* CPU number (0 = CPU 0, default) */
     int32_t group_fd;             /* perf event group leader fd (-1 = no group, default) */
+    PerfAttachment group;         /* high-level group leader attachment */
     uint64_t period;              /* sampling period (default 1 000 000) */
     uint32_t wakeup;              /* wakeup after N events (default 1) */
     bool inherit;                 /* inherit to child processes (default false) */
@@ -4115,16 +4175,8 @@ void cleanup_bpf_maps(void) {
     let load_function = generate_load_function_with_tail_calls base_name all_usage tail_call_analysis all_setup_code kfunc_dependencies (Ir.get_global_variables ir_multi_prog) in
     
     (* Global attachment storage (generated when attach/detach/perf attach/perf read are used) *)
-    let uses_perf_state = all_usage.uses_attach_perf || all_usage.uses_perf_read in
-    let perf_typedef = if uses_perf_state then
-      {|typedef struct PerfAttachment {
-  int perf_fd;
-  int link_id;
-  int prog_fd;
-  uint64_t generation;
-} PerfAttachment;
-|}
-    else "" in
+    let uses_perf_state = all_usage.uses_attach_perf || uses_any_perf_read in
+    let perf_typedef = "" in
     let perf_state_decls = if uses_perf_state then
       {|  struct perf_attachment_state {
     _Atomic uint64_t generation;
@@ -4297,6 +4349,60 @@ void cleanup_bpf_maps(void) {
       entry = entry->next;
     }
     return 0;
+  }
+
+  static struct attachment_entry *mark_next_perf_group_member_detaching_locked(struct attachment_entry *leader) {
+    if (!leader ||
+        leader->type != BPF_PROG_TYPE_PERF_EVENT ||
+        leader->perf_fd < 0 ||
+        leader->is_group_member) {
+      return NULL;
+    }
+
+    struct attachment_entry *entry = attached_programs;
+    while (entry) {
+      if (entry != leader &&
+          entry->type == BPF_PROG_TYPE_PERF_EVENT &&
+          entry->is_group_member &&
+          entry->group_leader_fd == leader->perf_fd &&
+          !entry->detaching) {
+        entry->detaching = 1;
+        invalidate_perf_attachment_state_locked(entry);
+        return entry;
+      }
+      entry = entry->next;
+    }
+    return NULL;
+  }
+
+  static int perf_mark_group_members_detaching_locked(struct attachment_entry *leader) {
+    int count = 0;
+    while (mark_next_perf_group_member_detaching_locked(leader) != NULL) {
+      count++;
+    }
+    return count;
+  }
+
+  static struct attachment_entry *find_marked_perf_group_member_locked(struct attachment_entry *leader) {
+    if (!leader ||
+        leader->type != BPF_PROG_TYPE_PERF_EVENT ||
+        leader->perf_fd < 0 ||
+        leader->is_group_member) {
+      return NULL;
+    }
+
+    struct attachment_entry *entry = attached_programs;
+    while (entry) {
+      if (entry != leader &&
+          entry->type == BPF_PROG_TYPE_PERF_EVENT &&
+          entry->is_group_member &&
+          entry->group_leader_fd == leader->perf_fd &&
+          entry->detaching) {
+        return entry;
+      }
+      entry = entry->next;
+    }
+    return NULL;
   }
 |}
     else "" in
@@ -4608,10 +4714,18 @@ void cleanup_bpf_maps(void) {
       "                invalidate_perf_attachment_state_locked(entry);\n"
     else "" in
     let perf_leader_guard_line = if uses_perf_state then
-      {|                if (perf_group_has_active_members_locked(entry)) {
-                    blocked_perf_leader = 1;
-                    entry = entry->next;
-                    continue;
+      {|                if (entry->type == BPF_PROG_TYPE_PERF_EVENT &&
+                    !entry->is_group_member &&
+                    perf_group_has_active_members_locked(entry)) {
+                    int cascade_count = perf_mark_group_members_detaching_locked(entry);
+                    fprintf(stderr,
+                            "Detaching perf group leader fd %d cascades to %d active member(s)\n",
+                            entry->perf_fd, cascade_count);
+                    struct attachment_entry *member = find_marked_perf_group_member_locked(entry);
+                    if (member) {
+                        entry = member;
+                        break;
+                    }
                 }
 |}
     else "" in
@@ -4681,13 +4795,17 @@ void cleanup_bpf_maps(void) {
         return;
     }
 
-    int blocked_perf_leader = 0;
     while (1) {
         /* Phase 1: mark one matching entry as detaching under the lock so concurrent
          * add_attachment can proceed without treating this entry as active. */
         pthread_mutex_lock(&attachment_mutex);
         struct attachment_entry *entry = attached_programs;
         while (entry) {
+            if (entry->type == BPF_PROG_TYPE_PERF_EVENT &&
+                entry->is_group_member &&
+                entry->detaching) {
+                break;
+            }
             if (entry->prog_fd == prog_fd && !entry->detaching) {
 %s                entry->detaching = 1;
 %s                break;
@@ -4715,11 +4833,6 @@ void cleanup_bpf_maps(void) {
         pthread_mutex_unlock(&attachment_mutex);
         free(entry);
     }
-    if (blocked_perf_leader) {
-        fprintf(stderr,
-                "detach: one or more perf group leaders for program fd %%d still have active members; detach members first\n",
-                prog_fd);
-    }
 }|} perf_leader_guard_line invalidate_call_line
     else "" in
     let perf_detach_function = if all_usage.uses_attach_perf then
@@ -4729,30 +4842,51 @@ void cleanup_bpf_maps(void) {
         return;
     }
 
-    int blocked_perf_leader = 0;
     pthread_mutex_lock(&attachment_mutex);
     struct attachment_entry *entry = find_attachment_by_id_locked(attachment.link_id);
     if (entry && !entry->detaching) {
-        if (perf_group_has_active_members_locked(entry)) {
+        if (!entry->is_group_member && perf_group_has_active_members_locked(entry)) {
+            int cascade_count = perf_mark_group_members_detaching_locked(entry);
             fprintf(stderr,
-                    "Cannot detach perf group leader fd %d while active members exist; detach members first\n",
-                    entry->perf_fd);
-            blocked_perf_leader = 1;
-            entry = NULL;
-        } else {
-            entry->detaching = 1;
-            invalidate_perf_attachment_state_locked(entry);
+                    "Detaching perf group leader fd %d cascades to %d active member(s)\n",
+                    entry->perf_fd, cascade_count);
         }
+        entry->detaching = 1;
+        invalidate_perf_attachment_state_locked(entry);
     } else {
         entry = NULL;
     }
     pthread_mutex_unlock(&attachment_mutex);
 
     if (!entry) {
-        if (!blocked_perf_leader) {
-            fprintf(stderr, "No active perf attachment found for link id %d\n", attachment.link_id);
-        }
+        fprintf(stderr, "No active perf attachment found for link id %d\n", attachment.link_id);
         return;
+    }
+
+    while (1) {
+        pthread_mutex_lock(&attachment_mutex);
+        struct attachment_entry *member = find_marked_perf_group_member_locked(entry);
+        if (!member) {
+            member = mark_next_perf_group_member_detaching_locked(entry);
+        }
+        pthread_mutex_unlock(&attachment_mutex);
+        if (!member) {
+            break;
+        }
+
+        ks_detach_attachment_entry(member, member->attachment_id);
+
+        pthread_mutex_lock(&attachment_mutex);
+        struct attachment_entry **member_cur = &attached_programs;
+        while (*member_cur) {
+            if (*member_cur == member) {
+                *member_cur = member->next;
+                break;
+            }
+            member_cur = &(*member_cur)->next;
+        }
+        pthread_mutex_unlock(&attachment_mutex);
+        free(member);
     }
 
     ks_detach_attachment_entry(entry, attachment.link_id);
@@ -4887,7 +5021,7 @@ static int ensure_bpf_dir(const char *path) {
     else "" in
 
     let perf_attach_function = if all_usage.uses_attach_perf then
-        {|int ks_open_perf_event(ks_perf_options ks_attr) {
+      let perf_attach_template = {|int ks_open_perf_event(ks_perf_options ks_attr) {
     /* Fill the BTF-derived struct perf_event_attr from KernelScript fields */
       ks_attr.attr.type = (__u32)ks_attr.perf_type;
     ks_attr.attr.size = sizeof(struct perf_event_attr);
@@ -4895,7 +5029,9 @@ static int ensure_bpf_dir(const char *path) {
     ks_attr.attr.sample_type = 0;
     ks_attr.attr.sample_period = ks_attr.period > 0 ? ks_attr.period : 1000000;
     ks_attr.attr.wakeup_events = ks_attr.wakeup > 0 ? ks_attr.wakeup : 1;
-    ks_attr.attr.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
+    ks_attr.attr.read_format =
+        PERF_FORMAT_TOTAL_TIME_ENABLED |
+        PERF_FORMAT_TOTAL_TIME_RUNNING;
     ks_attr.attr.inherit = ks_attr.inherit ? 1 : 0;
     ks_attr.attr.exclude_kernel = ks_attr.exclude_kernel ? 1 : 0;
     ks_attr.attr.exclude_user = ks_attr.exclude_user ? 1 : 0;
@@ -4904,6 +5040,11 @@ static int ensure_bpf_dir(const char *path) {
     int cpu = ks_attr.cpu;
     int pid = ks_attr.pid;
     int group_fd = ks_attr.group_fd;
+    if (ks_attr.group.perf_fd >= 0 &&
+        ks_attr.group.link_id > 0 &&
+        ks_attr.group.generation != 0) {
+        group_fd = ks_attr.group.perf_fd;
+    }
 
     if (pid < -1) {
         fprintf(stderr, "ks_open_perf_event: invalid pid %d (expected >= -1)\n", pid);
@@ -4915,6 +5056,10 @@ static int ensure_bpf_dir(const char *path) {
     }
     if (group_fd < -1) {
         fprintf(stderr, "ks_open_perf_event: invalid group_fd %d (expected -1 or a leader fd >= 0)\n", group_fd);
+        return -1;
+    }
+    if (ks_attr.group.perf_fd < -1) {
+        fprintf(stderr, "ks_open_perf_event: invalid group leader attachment fd %d\n", ks_attr.group.perf_fd);
         return -1;
     }
     if (pid == -1 && cpu == -1) {
@@ -4983,7 +5128,11 @@ PerfAttachment ks_attach_perf_event(int prog_fd, ks_perf_options opts, int flags
         return attachment;
     }
 
-    bool is_group_member = opts.group_fd >= 0;
+    int effective_group_fd =
+        (opts.group.perf_fd >= 0 && opts.group.link_id > 0 && opts.group.generation != 0)
+            ? opts.group.perf_fd
+            : opts.group_fd;
+    bool is_group_member = effective_group_fd >= 0;
     int perf_fd = ks_open_perf_event(opts);
     if (perf_fd < 0) return attachment;
 
@@ -5009,9 +5158,9 @@ PerfAttachment ks_attach_perf_event(int prog_fd, ks_perf_options opts, int flags
     }
 
     if (is_group_member) {
-        if (ks_restart_perf_group(opts.group_fd) != 0) {
+        if (ks_restart_perf_group(effective_group_fd) != 0) {
             fprintf(stderr, "Failed to restart perf event group for member fd %d leader fd %d\n",
-                    perf_fd, opts.group_fd);
+                    perf_fd, effective_group_fd);
             bpf_link__destroy(link);
             close(perf_fd);
             return attachment;
@@ -5029,12 +5178,12 @@ PerfAttachment ks_attach_perf_event(int prog_fd, ks_perf_options opts, int flags
              opts.perf_type,
              (unsigned long long)opts.perf_config,
              (unsigned long long)opts.period,
-             opts.group_fd);
+             effective_group_fd);
 
     int attachment_id = -1;
     uint64_t generation = 0;
     if (add_attachment(prog_fd, perf_target, (uint32_t)flags, link, 0, perf_fd,
-                       opts.group_fd, is_group_member ? 1 : 0,
+                       effective_group_fd, is_group_member ? 1 : 0,
                        BPF_PROG_TYPE_PERF_EVENT, &attachment_id, &generation) != 0) {
         ioctl(perf_fd, PERF_EVENT_IOC_DISABLE, 0);
         bpf_link__destroy(link);
@@ -5059,44 +5208,111 @@ PerfAttachment ks_attach_perf_event(int prog_fd, ks_perf_options opts, int flags
     return attachment;
 }
 |}
+      in
+      if all_usage.uses_perf_read_group then
+        Str.global_replace
+          (Str.regexp_string "        PERF_FORMAT_TOTAL_TIME_ENABLED |\n        PERF_FORMAT_TOTAL_TIME_RUNNING;")
+          "        PERF_FORMAT_TOTAL_TIME_ENABLED |\n        PERF_FORMAT_TOTAL_TIME_RUNNING |\n        PERF_FORMAT_ID |\n        PERF_FORMAT_GROUP;"
+          perf_attach_template
+      else perf_attach_template
     else "" in
 
-    let perf_read_function = if all_usage.uses_perf_read then
+    let perf_read_function = if uses_any_perf_read then
       {|struct ks_perf_read_value {
   uint64_t value;
   uint64_t time_enabled;
   uint64_t time_running;
 };
 
-/* Read the current hardware counter value from an open perf_fd.
- * Returns a multiplex-scaled count, or -1 on error. */
-int64_t ks_read_perf_count(int perf_fd) {
-  if (perf_fd < 0) {
-    fprintf(stderr, "ks_read_perf_count: invalid perf_fd %d\n", perf_fd);
+struct ks_perf_group_read_value {
+  uint64_t value;
+  uint64_t id;
+};
+
+struct ks_perf_group_read_buffer {
+  uint64_t nr;
+  uint64_t time_enabled;
+  uint64_t time_running;
+  struct ks_perf_group_read_value values[KS_PERF_GROUP_MAX_VALUES];
+};
+
+static int64_t ks_scale_perf_count(uint64_t value, uint64_t time_enabled, uint64_t time_running, const char *caller, int perf_fd) {
+  if (time_running == 0) {
+    fprintf(stderr, "%s: perf event fd %d has time_running=0\n", caller, perf_fd);
     return -1;
   }
-  struct ks_perf_read_value count = {0};
-  ssize_t n = read(perf_fd, &count, sizeof(count));
+  if (time_enabled == time_running) {
+    return (int64_t)value;
+  }
+  __uint128_t scaled =
+    ((__uint128_t)value * (__uint128_t)time_enabled) / time_running;
+  return (int64_t)scaled;
+}
+
+static int ks_read_perf_details_from_fd(int perf_fd, PerfReadDetails *details, const char *caller) {
+  if (perf_fd < 0) {
+    fprintf(stderr, "%s: invalid perf_fd %d\n", caller, perf_fd);
+    return -1;
+  }
+  if (!details) {
+    fprintf(stderr, "%s: NULL details output\n", caller);
+    return -1;
+  }
+
+  struct ks_perf_group_read_buffer group = {0};
+  ssize_t n = read(perf_fd, &group, sizeof(group));
   if (n < 0) {
-    fprintf(stderr, "ks_read_perf_count: read failed on perf_fd %d: %s\n",
+    fprintf(stderr, "%s: read failed on perf_fd %d: %s\n",
+        caller,
         perf_fd, strerror(errno));
     return -1;
   }
-  if (n != sizeof(count)) {
-    fprintf(stderr, "ks_read_perf_count: short read (%zd bytes) on perf_fd %d\n",
-        n, perf_fd);
+  uint64_t value = 0;
+  uint64_t time_enabled = 0;
+  uint64_t time_running = 0;
+  if (n == (ssize_t)sizeof(struct ks_perf_read_value)) {
+    struct ks_perf_read_value *count = (struct ks_perf_read_value *)&group;
+    value = count->value;
+    time_enabled = count->time_enabled;
+    time_running = count->time_running;
+  } else if (n >= (ssize_t)(sizeof(uint64_t) * 3 + sizeof(struct ks_perf_group_read_value))) {
+    if (group.nr == 0) {
+      fprintf(stderr, "%s: group read returned zero values on perf_fd %d\n", caller, perf_fd);
+      return -1;
+    }
+    value = group.values[0].value;
+    time_enabled = group.time_enabled;
+    time_running = group.time_running;
+  } else {
+    fprintf(stderr, "%s: short read (%zd bytes) on perf_fd %d\n",
+        caller, n, perf_fd);
     return -1;
   }
-  if (count.time_running == 0) {
-    fprintf(stderr, "ks_read_perf_count: perf event fd %d has time_running=0\n", perf_fd);
+
+  details->raw = (int64_t)value;
+  details->time_enabled = time_enabled;
+  details->time_running = time_running;
+  details->scaled = ks_scale_perf_count(value, time_enabled, time_running, caller, perf_fd);
+  return details->scaled < 0 ? -1 : 0;
+}
+
+/* Read the current raw hardware counter value from an open perf_fd. */
+int64_t ks_read_perf_count_raw(int perf_fd) {
+  PerfReadDetails details = {0};
+  if (ks_read_perf_details_from_fd(perf_fd, &details, "ks_read_perf_count_raw") != 0) {
     return -1;
   }
-  if (count.time_enabled == count.time_running) {
-    return (int64_t)count.value;
+  return details.raw;
+}
+
+/* Read the current hardware counter value from an open perf_fd.
+ * Returns a multiplex-scaled count, or -1 on error. */
+int64_t ks_read_perf_count(int perf_fd) {
+  PerfReadDetails details = {0};
+  if (ks_read_perf_details_from_fd(perf_fd, &details, "ks_read_perf_count") != 0) {
+    return -1;
   }
-  __uint128_t scaled =
-    ((__uint128_t)count.value * (__uint128_t)count.time_enabled) / count.time_running;
-  return (int64_t)scaled;
+  return details.scaled;
 }
 
 /* Read the counter for a first-class perf attachment value. */
@@ -5107,6 +5323,101 @@ int64_t ks_perf_attachment_read(PerfAttachment attachment) {
     return -1;
   }
   int64_t result = ks_read_perf_count(attachment.perf_fd);
+  perf_attachment_end_read(state);
+  return result;
+}
+
+/* Read the raw counter for a first-class perf attachment value. */
+int64_t ks_perf_attachment_read_raw(PerfAttachment attachment) {
+  struct perf_attachment_state *state = perf_attachment_begin_read(attachment);
+  if (!state) {
+    fprintf(stderr, "ks_perf_attachment_read_raw: invalid or stale perf attachment\n");
+    return -1;
+  }
+  int64_t result = ks_read_perf_count_raw(attachment.perf_fd);
+  perf_attachment_end_read(state);
+  return result;
+}
+
+/* Read raw, scaled, and multiplex timing details for a perf attachment. */
+PerfReadDetails ks_perf_attachment_read_details(PerfAttachment attachment) {
+  PerfReadDetails details = {
+    .raw = -1,
+    .scaled = -1,
+    .time_enabled = 0,
+    .time_running = 0,
+  };
+  struct perf_attachment_state *state = perf_attachment_begin_read(attachment);
+  if (!state) {
+    fprintf(stderr, "ks_perf_attachment_read_details: invalid or stale perf attachment\n");
+    return details;
+  }
+  (void)ks_read_perf_details_from_fd(attachment.perf_fd, &details, "ks_perf_attachment_read_details");
+  perf_attachment_end_read(state);
+  return details;
+}
+
+/* Read a same-time snapshot from a perf group leader.
+ * Values are multiplex-scaled individually using the group's timing fields. */
+PerfGroupRead ks_perf_attachment_read_group(PerfAttachment attachment) {
+  PerfGroupRead result = {
+    .count = 0,
+    .time_enabled = 0,
+    .time_running = 0,
+  };
+  struct perf_attachment_state *state = perf_attachment_begin_read(attachment);
+  if (!state) {
+    fprintf(stderr, "ks_perf_attachment_read_group: invalid or stale perf attachment\n");
+    return result;
+  }
+
+  struct ks_perf_group_read_buffer group = {0};
+  ssize_t n = read(attachment.perf_fd, &group, sizeof(group));
+  if (n < 0) {
+    fprintf(stderr, "ks_perf_attachment_read_group: read failed on perf_fd %d: %s\n",
+        attachment.perf_fd, strerror(errno));
+    perf_attachment_end_read(state);
+    return result;
+  }
+  if (n < (ssize_t)(sizeof(uint64_t) * 3)) {
+    fprintf(stderr, "ks_perf_attachment_read_group: short group header read (%zd bytes) on perf_fd %d\n",
+        n, attachment.perf_fd);
+    perf_attachment_end_read(state);
+    return result;
+  }
+
+  uint64_t available = 0;
+  size_t header_size = sizeof(uint64_t) * 3;
+  if ((size_t)n > header_size) {
+    available = ((size_t)n - header_size) / sizeof(struct ks_perf_group_read_value);
+  }
+  uint64_t nr = group.nr;
+  if (nr > available) {
+    fprintf(stderr,
+        "ks_perf_attachment_read_group: short group value read (nr=%llu available=%llu) on perf_fd %d\n",
+        (unsigned long long)nr,
+        (unsigned long long)available,
+        attachment.perf_fd);
+    nr = available;
+  }
+  if (nr > KS_PERF_GROUP_MAX_VALUES) {
+    fprintf(stderr,
+        "ks_perf_attachment_read_group: truncating %llu values to %u\n",
+        (unsigned long long)nr,
+        KS_PERF_GROUP_MAX_VALUES);
+    nr = KS_PERF_GROUP_MAX_VALUES;
+  }
+
+  result.count = (uint32_t)nr;
+  result.time_enabled = group.time_enabled;
+  result.time_running = group.time_running;
+  for (uint32_t i = 0; i < result.count; i++) {
+    result.ids[i] = group.values[i].id;
+    result.values[i] =
+      ks_scale_perf_count(group.values[i].value, group.time_enabled, group.time_running,
+                          "ks_perf_attachment_read_group", attachment.perf_fd);
+  }
+
   perf_attachment_end_read(state);
   return result;
 }

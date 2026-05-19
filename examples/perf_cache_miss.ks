@@ -11,17 +11,19 @@ fn on_cache_miss(ctx: *bpf_perf_event_data) -> i32 {
 fn main() -> i32 {
     var prog = load(on_cache_miss)
 
-    // Only perf_type + perf_config are required; pid, cpu, group_fd, period, wakeup and flag fields
+    // Only perf_type + perf_config are required; pid, cpu, group/group_fd, period, wakeup and flag fields
     // default to: pid=-1 (all procs), cpu=0, period=1_000_000, wakeup=1,
-    // group_fd=-1, inherit/exclude_kernel/exclude_user=false.
+    // no group, inherit/exclude_kernel/exclude_user=false.
     var cache = attach(prog, perf_options { perf_type: perf_type_hardware, perf_config: cache_misses, period: 10000000, inherit: true }, 0)
     // branch joins cache's perf event group. Adding a member restarts the whole group from zero.
-    var branch = attach(prog, perf_options { perf_type: perf_type_hardware, perf_config: branch_misses, period: 10000000, inherit: true, group_fd: cache.perf_fd }, 0)
+    var branch = attach(prog, perf_options { perf_type: perf_type_hardware, perf_config: branch_misses, period: 10000000, inherit: true, group: cache }, 0)
     print("Cache-miss and branch-miss perf_event demo attached")
     var cache_count = read(cache)
     print("Cache-miss count: %lld", cache_count)
     var branch_count = read(branch)
     print("Branch-miss count: %lld", branch_count)
+    var snapshot = read_group(cache)
+    print("Grouped snapshot entries: %u", snapshot.count)
 
     detach(branch)
     detach(cache)

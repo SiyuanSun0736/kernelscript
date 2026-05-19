@@ -98,7 +98,7 @@ fn main() -> i32 {
     - `flags`: Attachment flags (context-dependent)
 - Perf event form:
     - `handle`: Program handle returned from `load()`
-    - `opts`: `perf_options` value — only `perf_type` and `perf_config` are required; all other fields have defaults, including `group_fd=-1`
+    - `opts`: `perf_options` value — only `perf_type` and `perf_config` are required; all other fields have defaults, including no group (`group` invalid and `group_fd=-1`)
     - `flags`: Must be `0` for perf attaches; nonzero values are rejected
 
 **Return Value:**
@@ -126,11 +126,13 @@ var cache = attach(perf_prog, perf_options { perf_type: perf_type_hardware, perf
 var branch = attach(perf_prog, perf_options {
     perf_type: perf_type_hardware,
     perf_config: branch_misses,
-    group_fd: cache.perf_fd,
+    group: cache,
 }, 0)
 detach(branch)
 detach(cache)
 ```
+
+Grouped events are scheduled as one atomic PMU unit. Separate events and separate groups may be multiplexed, but members inside one group cannot be independently multiplexed. Static groups that exceed the target PMU counter limit are rejected at compile time; override the detected/default limit with `KERNELSCRIPT_PERF_GROUP_MAX_EVENTS` when compiling for a different target.
 
 **Context-specific implementations:**
 - **eBPF:** Not available
@@ -183,7 +185,50 @@ detach(prog)  // Clean up
 - Returns a scaled value when `time_running < time_enabled`
 - Returns `-1` on invalid/stale attachment or read failure
 - Reads use the attachment's `perf_fd` directly; the internal token detects copied handles used after detach.
-- Group snapshot reads are not supported yet; read grouped attachments individually.
+- Use `read_group(leader)` when you need a same-time group snapshot.
+
+---
+
+#### `read_raw(handle)`
+**Signature:** `read_raw(handle: PerfAttachment) -> i64`
+**Variadic:** No
+**Context:** Userspace only
+
+**Description:** Read the unscaled raw hardware/software counter value from a perf attachment.
+
+**Return Value:**
+- Returns the raw counter value
+- Returns `-1` on invalid/stale attachment or read failure
+
+---
+
+#### `read_details(handle)`
+**Signature:** `read_details(handle: PerfAttachment) -> PerfReadDetails`
+**Variadic:** No
+**Context:** Userspace only
+
+**Description:** Read raw, scaled, `time_enabled`, and `time_running` details for a perf attachment.
+
+**Return Value:**
+- `raw`: unscaled counter value
+- `scaled`: multiplex-corrected value, or `-1` on timing/read error
+- `time_enabled`: perf enabled time
+- `time_running`: perf running time
+
+---
+
+#### `read_group(leader)`
+**Signature:** `read_group(leader: PerfAttachment) -> PerfGroupRead`
+**Variadic:** No
+**Context:** Userspace only
+
+**Description:** Read a same-time snapshot from a perf event group leader. This enables `PERF_FORMAT_GROUP | PERF_FORMAT_ID` in generated perf events.
+
+**Return Value:**
+- `count`: number of entries returned, capped at 16
+- `values`: multiplex-scaled values from the snapshot
+- `ids`: perf event IDs for the returned values
+- `time_enabled` / `time_running`: timing fields used for scaling
 
 ---
 
