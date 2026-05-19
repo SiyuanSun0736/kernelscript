@@ -3910,6 +3910,7 @@ typedef struct {
   uint64_t perf_config;         /* perf_event_attr.config value for the chosen type */
     int32_t pid;                  /* process ID (-1 = all processes, default) */
     int32_t cpu;                  /* CPU number (0 = CPU 0, default) */
+    int32_t group_fd;             /* perf event group leader fd (-1 = no group, default) */
     uint64_t period;              /* sampling period (default 1 000 000) */
     uint32_t wakeup;              /* wakeup after N events (default 1) */
     bool inherit;                 /* inherit to child processes (default false) */
@@ -4275,6 +4276,28 @@ void cleanup_bpf_maps(void) {
     }
     return NULL;
   }
+
+  static int perf_group_has_active_members_locked(struct attachment_entry *leader) {
+    if (!leader ||
+        leader->type != BPF_PROG_TYPE_PERF_EVENT ||
+        leader->perf_fd < 0 ||
+        leader->is_group_member) {
+      return 0;
+    }
+
+    struct attachment_entry *entry = attached_programs;
+    while (entry) {
+      if (entry != leader &&
+          entry->type == BPF_PROG_TYPE_PERF_EVENT &&
+          entry->is_group_member &&
+          entry->group_leader_fd == leader->perf_fd &&
+          !entry->detaching) {
+        return 1;
+      }
+      entry = entry->next;
+    }
+    return 0;
+  }
 |}
     else "" in
     let attachment_storage = if all_usage.uses_attach || all_usage.uses_detach || uses_perf_state then
@@ -4288,6 +4311,8 @@ void cleanup_bpf_maps(void) {
     struct bpf_link *link;    // For kprobe/tracepoint programs (NULL for XDP)
     int ifindex;              // For XDP programs (0 for kprobe/tracepoint)
     int perf_fd;              // For perf_event programs (-1 otherwise)
+    int group_leader_fd;      // Perf group leader fd for members (-1 otherwise)
+    int is_group_member;      // Non-zero when perf_fd belongs to a group leader
     int detaching;            // Non-zero while teardown is in progress
     uint64_t generation;      // PerfAttachment stale-handle token
     enum bpf_prog_type type;
@@ -4303,6 +4328,7 @@ void cleanup_bpf_maps(void) {
   // Duplicate check is performed atomically under the same lock as insertion.
   static int add_attachment(int prog_fd, const char *target, uint32_t flags,
          struct bpf_link *link, int ifindex, int perf_fd,
+         int group_leader_fd, int is_group_member,
          enum bpf_prog_type type, int *attachment_id_out,
          uint64_t *generation_out) {
     struct attachment_entry *entry = malloc(sizeof(struct attachment_entry));
@@ -4319,6 +4345,8 @@ void cleanup_bpf_maps(void) {
     entry->link = link;
     entry->ifindex = ifindex;
     entry->perf_fd = perf_fd;
+    entry->group_leader_fd = group_leader_fd;
+    entry->is_group_member = is_group_member;
     entry->type = type;
 
     entry->detaching = 0;
@@ -4401,7 +4429,7 @@ void cleanup_bpf_maps(void) {
             }
             
             // Store XDP attachment (no bpf_link for XDP)
-            if (add_attachment(prog_fd, target, flags, NULL, ifindex, -1, BPF_PROG_TYPE_XDP, NULL, NULL) != 0) {
+            if (add_attachment(prog_fd, target, flags, NULL, ifindex, -1, -1, 0, BPF_PROG_TYPE_XDP, NULL, NULL) != 0) {
                 // If storage fails, detach and return error
                 bpf_xdp_detach(ifindex, flags, NULL);
                 return -1;
@@ -4431,7 +4459,7 @@ void cleanup_bpf_maps(void) {
             printf("Kprobe attached to function: %s\n", target);
             
             // Store probe attachment for later cleanup
-            if (add_attachment(prog_fd, target, flags, link, 0, -1, BPF_PROG_TYPE_KPROBE, NULL, NULL) != 0) {
+            if (add_attachment(prog_fd, target, flags, link, 0, -1, -1, 0, BPF_PROG_TYPE_KPROBE, NULL, NULL) != 0) {
                 // If storage fails, destroy link and return error
                 bpf_link__destroy(link);
                 return -1;
@@ -4460,7 +4488,7 @@ void cleanup_bpf_maps(void) {
             printf("Fentry/fexit program attached to function: %s\n", target);
             
             // Store tracing attachment for later cleanup
-            if (add_attachment(prog_fd, target, flags, link, 0, -1, BPF_PROG_TYPE_TRACING, NULL, NULL) != 0) {
+            if (add_attachment(prog_fd, target, flags, link, 0, -1, -1, 0, BPF_PROG_TYPE_TRACING, NULL, NULL) != 0) {
                 // If storage fails, destroy link and return error
                 bpf_link__destroy(link);
                 return -1;
@@ -4504,7 +4532,7 @@ void cleanup_bpf_maps(void) {
             }
             
             // Store tracepoint attachment for later cleanup
-            if (add_attachment(prog_fd, target, flags, link, 0, -1, BPF_PROG_TYPE_TRACEPOINT, NULL, NULL) != 0) {
+            if (add_attachment(prog_fd, target, flags, link, 0, -1, -1, 0, BPF_PROG_TYPE_TRACEPOINT, NULL, NULL) != 0) {
                 // If storage fails, destroy link and return error
                 bpf_link__destroy(link);
                 return -1;
@@ -4541,7 +4569,7 @@ void cleanup_bpf_maps(void) {
             }
             
             // Store TC attachment for later cleanup (flags no longer needed for direction)
-            if (add_attachment(prog_fd, target, 0, link, ifindex, -1, BPF_PROG_TYPE_SCHED_CLS, NULL, NULL) != 0) {
+            if (add_attachment(prog_fd, target, 0, link, ifindex, -1, -1, 0, BPF_PROG_TYPE_SCHED_CLS, NULL, NULL) != 0) {
                 // If storage fails, destroy link and return error
                 bpf_link__destroy(link);
                 return -1;
@@ -4578,6 +4606,14 @@ void cleanup_bpf_maps(void) {
     else "" in
     let invalidate_call_line = if uses_perf_state then
       "                invalidate_perf_attachment_state_locked(entry);\n"
+    else "" in
+    let perf_leader_guard_line = if uses_perf_state then
+      {|                if (perf_group_has_active_members_locked(entry)) {
+                    blocked_perf_leader = 1;
+                    entry = entry->next;
+                    continue;
+                }
+|}
     else "" in
     let detach_entry_dispatch = if all_usage.uses_detach || all_usage.uses_attach_perf then
       sprintf {|static void ks_detach_attachment_entry(struct attachment_entry *entry, int identifier_for_logs) {
@@ -4645,6 +4681,7 @@ void cleanup_bpf_maps(void) {
         return;
     }
 
+    int blocked_perf_leader = 0;
     while (1) {
         /* Phase 1: mark one matching entry as detaching under the lock so concurrent
          * add_attachment can proceed without treating this entry as active. */
@@ -4652,7 +4689,7 @@ void cleanup_bpf_maps(void) {
         struct attachment_entry *entry = attached_programs;
         while (entry) {
             if (entry->prog_fd == prog_fd && !entry->detaching) {
-                entry->detaching = 1;
+%s                entry->detaching = 1;
 %s                break;
             }
             entry = entry->next;
@@ -4678,7 +4715,12 @@ void cleanup_bpf_maps(void) {
         pthread_mutex_unlock(&attachment_mutex);
         free(entry);
     }
-}|} invalidate_call_line
+    if (blocked_perf_leader) {
+        fprintf(stderr,
+                "detach: one or more perf group leaders for program fd %%d still have active members; detach members first\n",
+                prog_fd);
+    }
+}|} perf_leader_guard_line invalidate_call_line
     else "" in
     let perf_detach_function = if all_usage.uses_attach_perf then
       {|void ks_detach_perf_attachment(PerfAttachment attachment) {
@@ -4687,18 +4729,29 @@ void cleanup_bpf_maps(void) {
         return;
     }
 
+    int blocked_perf_leader = 0;
     pthread_mutex_lock(&attachment_mutex);
     struct attachment_entry *entry = find_attachment_by_id_locked(attachment.link_id);
     if (entry && !entry->detaching) {
-        entry->detaching = 1;
-        invalidate_perf_attachment_state_locked(entry);
+        if (perf_group_has_active_members_locked(entry)) {
+            fprintf(stderr,
+                    "Cannot detach perf group leader fd %d while active members exist; detach members first\n",
+                    entry->perf_fd);
+            blocked_perf_leader = 1;
+            entry = NULL;
+        } else {
+            entry->detaching = 1;
+            invalidate_perf_attachment_state_locked(entry);
+        }
     } else {
         entry = NULL;
     }
     pthread_mutex_unlock(&attachment_mutex);
 
     if (!entry) {
-        fprintf(stderr, "No active perf attachment found for link id %d\n", attachment.link_id);
+        if (!blocked_perf_leader) {
+            fprintf(stderr, "No active perf attachment found for link id %d\n", attachment.link_id);
+        }
         return;
     }
 
@@ -4842,6 +4895,7 @@ static int ensure_bpf_dir(const char *path) {
     ks_attr.attr.sample_type = 0;
     ks_attr.attr.sample_period = ks_attr.period > 0 ? ks_attr.period : 1000000;
     ks_attr.attr.wakeup_events = ks_attr.wakeup > 0 ? ks_attr.wakeup : 1;
+    ks_attr.attr.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
     ks_attr.attr.inherit = ks_attr.inherit ? 1 : 0;
     ks_attr.attr.exclude_kernel = ks_attr.exclude_kernel ? 1 : 0;
     ks_attr.attr.exclude_user = ks_attr.exclude_user ? 1 : 0;
@@ -4849,6 +4903,7 @@ static int ensure_bpf_dir(const char *path) {
 
     int cpu = ks_attr.cpu;
     int pid = ks_attr.pid;
+    int group_fd = ks_attr.group_fd;
 
     if (pid < -1) {
         fprintf(stderr, "ks_open_perf_event: invalid pid %d (expected >= -1)\n", pid);
@@ -4858,21 +4913,50 @@ static int ensure_bpf_dir(const char *path) {
         fprintf(stderr, "ks_open_perf_event: invalid cpu %d (expected >= -1)\n", cpu);
         return -1;
     }
+    if (group_fd < -1) {
+        fprintf(stderr, "ks_open_perf_event: invalid group_fd %d (expected -1 or a leader fd >= 0)\n", group_fd);
+        return -1;
+    }
     if (pid == -1 && cpu == -1) {
         fprintf(stderr, "ks_open_perf_event: system-wide perf events require an explicit cpu >= 0\n");
         return -1;
     }
 
-    int perf_fd = (int)syscall(SYS_perf_event_open, &ks_attr.attr, pid, cpu, -1, PERF_FLAG_FD_CLOEXEC);
+    int perf_fd = (int)syscall(SYS_perf_event_open, &ks_attr.attr, pid, cpu, group_fd, PERF_FLAG_FD_CLOEXEC);
     if (perf_fd < 0) {
-        fprintf(stderr, "ks_open_perf_event: perf_event_open failed: %s\n", strerror(errno));
+        fprintf(stderr, "ks_open_perf_event: perf_event_open failed for group_fd %d: %s\n",
+                group_fd, strerror(errno));
         return -1;
     }
     return perf_fd;
 }
 
+static int ks_restart_perf_group(int group_fd) {
+    if (group_fd < 0) {
+        fprintf(stderr, "ks_restart_perf_group: invalid group leader fd %d\n", group_fd);
+        return -1;
+    }
+    if (ioctl(group_fd, PERF_EVENT_IOC_DISABLE, PERF_IOC_FLAG_GROUP) != 0) {
+        fprintf(stderr, "Failed to disable perf event group leader fd %d: %s\n",
+                group_fd, strerror(errno));
+        return -1;
+    }
+    if (ioctl(group_fd, PERF_EVENT_IOC_RESET, PERF_IOC_FLAG_GROUP) != 0) {
+        fprintf(stderr, "Failed to reset perf event group leader fd %d: %s\n",
+                group_fd, strerror(errno));
+        return -1;
+    }
+    if (ioctl(group_fd, PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP) != 0) {
+        fprintf(stderr, "Failed to enable perf event group leader fd %d: %s\n",
+                group_fd, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
 /* Attach a perf_event BPF program using a ks_perf_options config.
- * Opens the perf fd, resets, attaches, and enables counting in one step. */
+ * Standalone events are reset and enabled directly; group members restart their
+ * leader group after the member link is attached. */
 PerfAttachment ks_attach_perf_event(int prog_fd, ks_perf_options opts, int flags) {
     PerfAttachment attachment = {
         .perf_fd = -1,
@@ -4899,6 +4983,7 @@ PerfAttachment ks_attach_perf_event(int prog_fd, ks_perf_options opts, int flags
         return attachment;
     }
 
+    bool is_group_member = opts.group_fd >= 0;
     int perf_fd = ks_open_perf_event(opts);
     if (perf_fd < 0) return attachment;
 
@@ -4909,7 +4994,7 @@ PerfAttachment ks_attach_perf_event(int prog_fd, ks_perf_options opts, int flags
         return attachment;
     }
 
-    if (ioctl(perf_fd, PERF_EVENT_IOC_RESET, 0) != 0) {
+    if (!is_group_member && ioctl(perf_fd, PERF_EVENT_IOC_RESET, 0) != 0) {
         fprintf(stderr, "Failed to reset perf event fd %d: %s\n", perf_fd, strerror(errno));
         close(perf_fd);
         return attachment;
@@ -4923,7 +5008,15 @@ PerfAttachment ks_attach_perf_event(int prog_fd, ks_perf_options opts, int flags
         return attachment;
     }
 
-    if (ioctl(perf_fd, PERF_EVENT_IOC_ENABLE, 0) != 0) {
+    if (is_group_member) {
+        if (ks_restart_perf_group(opts.group_fd) != 0) {
+            fprintf(stderr, "Failed to restart perf event group for member fd %d leader fd %d\n",
+                    perf_fd, opts.group_fd);
+            bpf_link__destroy(link);
+            close(perf_fd);
+            return attachment;
+        }
+    } else if (ioctl(perf_fd, PERF_EVENT_IOC_ENABLE, 0) != 0) {
         fprintf(stderr, "Failed to enable perf event fd %d: %s\n", perf_fd, strerror(errno));
         bpf_link__destroy(link);
         close(perf_fd);
@@ -4932,14 +5025,16 @@ PerfAttachment ks_attach_perf_event(int prog_fd, ks_perf_options opts, int flags
 
     char perf_target[128];
     snprintf(perf_target, sizeof(perf_target),
-             "perf_event:type=%d config=%llu period=%llu",
+             "perf_event:type=%d config=%llu period=%llu group_fd=%d",
              opts.perf_type,
              (unsigned long long)opts.perf_config,
-             (unsigned long long)opts.period);
+             (unsigned long long)opts.period,
+             opts.group_fd);
 
     int attachment_id = -1;
     uint64_t generation = 0;
     if (add_attachment(prog_fd, perf_target, (uint32_t)flags, link, 0, perf_fd,
+                       opts.group_fd, is_group_member ? 1 : 0,
                        BPF_PROG_TYPE_PERF_EVENT, &attachment_id, &generation) != 0) {
         ioctl(perf_fd, PERF_EVENT_IOC_DISABLE, 0);
         bpf_link__destroy(link);
@@ -4967,14 +5062,20 @@ PerfAttachment ks_attach_perf_event(int prog_fd, ks_perf_options opts, int flags
     else "" in
 
     let perf_read_function = if all_usage.uses_perf_read then
-      {|/* Read the current hardware counter value from an open perf_fd.
- * Returns the raw 64-bit count, or -1 on error. */
+      {|struct ks_perf_read_value {
+  uint64_t value;
+  uint64_t time_enabled;
+  uint64_t time_running;
+};
+
+/* Read the current hardware counter value from an open perf_fd.
+ * Returns a multiplex-scaled count, or -1 on error. */
 int64_t ks_read_perf_count(int perf_fd) {
   if (perf_fd < 0) {
     fprintf(stderr, "ks_read_perf_count: invalid perf_fd %d\n", perf_fd);
     return -1;
   }
-  uint64_t count = 0;
+  struct ks_perf_read_value count = {0};
   ssize_t n = read(perf_fd, &count, sizeof(count));
   if (n < 0) {
     fprintf(stderr, "ks_read_perf_count: read failed on perf_fd %d: %s\n",
@@ -4986,7 +5087,16 @@ int64_t ks_read_perf_count(int perf_fd) {
         n, perf_fd);
     return -1;
   }
-  return (int64_t)count;
+  if (count.time_running == 0) {
+    fprintf(stderr, "ks_read_perf_count: perf event fd %d has time_running=0\n", perf_fd);
+    return -1;
+  }
+  if (count.time_enabled == count.time_running) {
+    return (int64_t)count.value;
+  }
+  __uint128_t scaled =
+    ((__uint128_t)count.value * (__uint128_t)count.time_enabled) / count.time_running;
+  return (int64_t)scaled;
 }
 
 /* Read the counter for a first-class perf attachment value. */

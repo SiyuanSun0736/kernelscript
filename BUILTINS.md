@@ -98,7 +98,7 @@ fn main() -> i32 {
     - `flags`: Attachment flags (context-dependent)
 - Perf event form:
     - `handle`: Program handle returned from `load()`
-    - `opts`: `perf_options` value — only `perf_type` and `perf_config` are required; all other fields have defaults
+    - `opts`: `perf_options` value — only `perf_type` and `perf_config` are required; all other fields have defaults, including `group_fd=-1`
     - `flags`: Must be `0` for perf attaches; nonzero values are rejected
 
 **Return Value:**
@@ -120,6 +120,16 @@ var perf_att = attach(perf_prog, perf_options { perf_type: perf_type_hardware, p
 var count = read(perf_att)
 detach(perf_att)
 detach(perf_prog)
+
+// Grouped perf events: branch joins cache's leader group. Adding a member restarts the group.
+var cache = attach(perf_prog, perf_options { perf_type: perf_type_hardware, perf_config: cache_misses }, 0)
+var branch = attach(perf_prog, perf_options {
+    perf_type: perf_type_hardware,
+    perf_config: branch_misses,
+    group_fd: cache.perf_fd,
+}, 0)
+detach(branch)
+detach(cache)
 ```
 
 **Context-specific implementations:**
@@ -163,15 +173,17 @@ detach(prog)  // Clean up
 **Variadic:** No
 **Context:** Userspace only
 
-**Description:** Read the current hardware/software counter value from a perf attachment.
+**Description:** Read the current hardware/software counter value from a perf attachment. If the kernel multiplexed the event, the value is scaled with `time_enabled / time_running`.
 
 **Parameters:**
 - `handle`: Perf attachment returned from `attach(handle, perf_options, flags)`
 
 **Return Value:**
-- Returns the raw 64-bit counter value on success
+- Returns the raw 64-bit counter value when no multiplexing occurred
+- Returns a scaled value when `time_running < time_enabled`
 - Returns `-1` on invalid/stale attachment or read failure
 - Reads use the attachment's `perf_fd` directly; the internal token detects copied handles used after detach.
+- Group snapshot reads are not supported yet; read grouped attachments individually.
 
 ---
 

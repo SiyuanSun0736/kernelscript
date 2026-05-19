@@ -14,8 +14,11 @@ fn main() -> i32 {
     // pid: 0 = current process, cpu: -1 = any CPU (standard per-process monitoring).
     // page_faults (PERF_COUNT_SW_PAGE_FAULTS) is the most reliable software event:
     // every heap/stack allocation triggers minor page faults, no scheduler dependency.
-    var att = attach(prog, perf_options { perf_type: perf_type_software, perf_config: page_faults, pid: 0, cpu: -1, period: 1 }, 0)
-    print("Page-fault perf_event demo attached")
+    var page = attach(prog, perf_options { perf_type: perf_type_software, perf_config: page_faults, pid: 0, cpu: -1, period: 1 }, 0)
+    // branch joins cache's perf event group. Adding a member restarts the whole group from zero.
+    var branch = attach(prog, perf_options { perf_type: perf_type_hardware, perf_config: branch_misses, period: 10000000, inherit: true}, 0)
+    
+    print("perf_event demo attached")
 
     // Repeatedly increment a counter; stack/heap activity will generate page faults.
     var x: i64 = 0
@@ -23,11 +26,14 @@ fn main() -> i32 {
         x = x + 1
     }
 
-    var count = read(att)
-    print("Page-fault count: %lld", count)
+    var page_fault_count = read(page)
+    print("Page-fault count: %lld", page_fault_count)
+    var branch_count = read(branch)
+    print("Branch-miss count: %lld", branch_count)
 
-    detach(att)
-    print("Page-fault perf_event demo detached")
+    detach(page)
+    detach(branch)
+    print("perf_event demo detached")
     detach(prog)
     return 0
 }

@@ -349,6 +349,7 @@ let builtin_types = [
     ("perf_config",    U64);
     ("pid",            I32);
     ("cpu",            I32);
+    ("group_fd",       I32);
     ("period",         U64);
     ("wakeup",         U32);
     ("inherit",        Bool);
@@ -374,6 +375,7 @@ let get_struct_field_defaults = function
       Some [
         ("pid",            IntLit (Signed64 (-1L),      None));
         ("cpu",            IntLit (Signed64 0L,         None));
+        ("group_fd",       IntLit (Signed64 (-1L),      None));
         ("period",         IntLit (Unsigned64 1000000L, None));
         ("wakeup",         IntLit (Unsigned64 1L,       None));
         ("inherit",        BoolLit false);

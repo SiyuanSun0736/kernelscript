@@ -57,6 +57,7 @@ let perf_attr_expr ~pid ~cpu =
       ("perf_config", perf_config_value "perf_hw_config" "branch_misses" 5L);
       ("pid", int32_value pid);
       ("cpu", int32_value cpu);
+      ("group_fd", int32_value (-1L));
       ("period", uint64_value 1000000L);
       ("wakeup", uint32_value 1L);
       ("inherit", bool_value false);
@@ -78,6 +79,19 @@ let make_generated_code instructions =
   in
   let ir_multi_prog = make_ir_multi_program "test" ~userspace_program:userspace_prog test_pos in
   generate_complete_userspace_program_from_ir userspace_prog [] ir_multi_prog "test.ks"
+
+let make_generated_code_from_source source =
+  let ast = parse_string source in
+  let ast_with_builtins = Kernelscript.Stdlib.get_builtin_types () @ ast in
+  let symbol_table = Kernelscript.Symbol_table.build_symbol_table ast_with_builtins in
+  let annotated_ast, _typed_programs =
+    type_check_and_annotate_ast ~symbol_table:(Some symbol_table) ast_with_builtins
+  in
+  let ir_multi_prog = Kernelscript.Ir_generator.generate_ir annotated_ast symbol_table "test" in
+  match ir_multi_prog.userspace_program with
+  | Some userspace_prog ->
+      generate_complete_userspace_program_from_ir userspace_prog [] ir_multi_prog "test.ks"
+  | None -> fail "Expected userspace program in generated IR"
 
 let test_perf_event_codegen_enforces_pid_cpu_rules () =
   let prog_handle = make_ir_value (IRVariable "prog") IRI32 test_pos in
@@ -140,6 +154,7 @@ let perf_attr_expr_with ~period ~wakeup =
       ("perf_config", perf_config_value "perf_hw_config" "branch_misses" 5L);
       ("pid",     int32_value 1234L);
       ("cpu",     int32_value 0L);
+      ("group_fd", int32_value (-1L));
       ("period",  uint64_value period);
       ("wakeup",  uint32_value wakeup);
       ("inherit",         bool_value false);
@@ -195,8 +210,10 @@ let test_perf_event_counting_starts_correctly () =
     (appears_before code "PERF_EVENT_IOC_RESET" "PERF_EVENT_IOC_ENABLE");
 
   (* 5. BPF program is linked to the perf fd before enabling (attach before enable). *)
-  check bool "attach_perf_event called before IOC_ENABLE" true
-    (appears_before code "bpf_program__attach_perf_event" "PERF_EVENT_IOC_ENABLE");
+  check bool "attach_perf_event called before standalone IOC_ENABLE" true
+    (appears_before code
+       "bpf_program__attach_perf_event(prog, perf_fd)"
+       "else if (ioctl(perf_fd, PERF_EVENT_IOC_ENABLE, 0) != 0)");
 
   (* 6. Counting truly kicks off: IOC_ENABLE is the last step and must be present. *)
   check bool "IOC_ENABLE present to start counting" true
@@ -222,6 +239,42 @@ let test_perf_event_period_and_wakeup_custom () =
     (contains_substr code "ks_attr.period > 0 ? ks_attr.period : 1000000");
   check bool "runtime wakeup expression present for custom wakeup" true
     (contains_substr code "ks_attr.wakeup > 0 ? ks_attr.wakeup : 1")
+
+let test_perf_event_group_fd_codegen () =
+  let code = make_perf_code_with ~period:1000000L ~wakeup:1L in
+  check bool "ks_perf_options carries group_fd" true
+    (contains_substr code "int32_t group_fd;");
+  check bool "hand-built perf options default group_fd to -1" true
+    (contains_substr code ".group_fd = -1");
+  check bool "group_fd copied from options" true
+    (contains_substr code "int group_fd = ks_attr.group_fd;");
+  check bool "invalid group_fd rejected" true
+    (contains_substr code "if (group_fd < -1)");
+  check bool "perf_event_open receives variable group_fd" true
+    (contains_substr code "pid, cpu, group_fd, PERF_FLAG_FD_CLOEXEC");
+  check bool "perf_event_open no longer hardcodes no group" false
+    (contains_substr code "pid, cpu, -1, PERF_FLAG_FD_CLOEXEC");
+  check bool "read_format requests multiplex timing" true
+    (contains_substr code "PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING")
+
+let test_perf_event_group_member_lifecycle_codegen () =
+  let code = make_perf_code_with ~period:1000000L ~wakeup:1L in
+  check bool "member branch detected from group_fd" true
+    (contains_substr code "bool is_group_member = opts.group_fd >= 0;");
+  check bool "group restart helper emitted" true
+    (contains_substr code "static int ks_restart_perf_group(int group_fd)");
+  check bool "group disable uses PERF_IOC_FLAG_GROUP" true
+    (contains_substr code "PERF_EVENT_IOC_DISABLE, PERF_IOC_FLAG_GROUP");
+  check bool "group reset uses PERF_IOC_FLAG_GROUP" true
+    (contains_substr code "PERF_EVENT_IOC_RESET, PERF_IOC_FLAG_GROUP");
+  check bool "group enable uses PERF_IOC_FLAG_GROUP" true
+    (contains_substr code "PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP");
+  check bool "member restart happens after link attach" true
+    (appears_before code
+       "bpf_program__attach_perf_event(prog, perf_fd)"
+       "ks_restart_perf_group(opts.group_fd)");
+  check bool "attachment stores group metadata" true
+    (contains_substr code "opts.group_fd, is_group_member ? 1 : 0")
 
 let test_standard_attach_uses_libbpf_error_checks () =
   let prog_handle = make_ir_value (IRVariable "prog") IRI32 test_pos in
@@ -301,6 +354,49 @@ let test_read_helpers_generated_when_used () =
     (contains_substr code "close(dup_fd)");
   check bool "read no longer walks attachment list by link id" false
     (contains_substr code "struct attachment_entry *cur = find_attachment_by_id_locked(attachment.link_id)")
+
+let test_perf_read_helper_scales_multiplexed_counts () =
+  let prog_handle = make_ir_value (IRVariable "prog") IRI32 test_pos in
+  let attr_value  = make_ir_value (IRVariable "attr") (IRStruct ("perf_options", [])) test_pos in
+  let flags_value = uint32_value 0L in
+  let attachment_value =
+    make_ir_value
+      (IRVariable "att")
+      (IRStruct ("PerfAttachment", [("perf_fd", IRI32); ("link_id", IRI32); ("prog_fd", IRI32); ("generation", IRU64)]))
+      test_pos
+  in
+  let count_value = make_ir_value (IRVariable "count") IRI64 test_pos in
+  let attr_decl =
+    make_ir_instruction
+      (IRVariableDecl (attr_value, IRStruct ("perf_options", []),
+                       Some (perf_attr_expr_with ~period:1000000L ~wakeup:1L)))
+      test_pos
+  in
+  let attach_call =
+    make_ir_instruction
+      (IRCall (DirectCall "attach", [prog_handle; attr_value; flags_value], Some attachment_value))
+      test_pos
+  in
+  let read_call =
+    make_ir_instruction
+      (IRCall (DirectCall "read", [attachment_value], Some count_value))
+      test_pos
+  in
+  let code = make_generated_code [attr_decl; attach_call; read_call] in
+  check bool "read helper uses timing read struct" true
+    (contains_substr code "struct ks_perf_read_value");
+  check bool "read helper includes time_enabled" true
+    (contains_substr code "uint64_t time_enabled;");
+  check bool "read helper includes time_running" true
+    (contains_substr code "uint64_t time_running;");
+  check bool "time_running zero guard emitted" true
+    (contains_substr code "if (count.time_running == 0)");
+  check bool "fast path returns raw value" true
+    (contains_substr code "if (count.time_enabled == count.time_running)");
+  check bool "scaled path uses 128-bit intermediate" true
+    (contains_substr code "__uint128_t scaled");
+  check bool "scaled path multiplies by time_enabled" true
+    (contains_substr code "count.value * (__uint128_t)count.time_enabled")
 
 let test_perf_attach_event_function_generated () =
   (* attach(prog, perf_options{...}, 0) must generate ks_attach_perf_event which
@@ -393,6 +489,40 @@ let test_detach_attach_concurrent_window () =
   check bool "detach invalidates stale perf attachment handles before close" true
     (contains_substr code "invalidate_perf_attachment_state_locked(entry)")
 
+let test_perf_group_source_field_access_codegen () =
+  let source = {|
+@perf_event
+fn on_event(ctx: *bpf_perf_event_data) -> i32 {
+    return 0
+}
+
+fn main() -> i32 {
+    var prog = load(on_event)
+    var cache = attach(prog, perf_options {
+        perf_type: perf_type_hardware,
+        perf_config: cache_misses,
+    }, 0)
+    var branch = attach(prog, perf_options {
+        perf_type: perf_type_hardware,
+        perf_config: branch_misses,
+        group_fd: cache.perf_fd,
+    }, 0)
+    detach(branch)
+    detach(cache)
+    detach(prog)
+    return 0
+}
+|} in
+  let code = make_generated_code_from_source source in
+  check bool "source group_fd field access type-checks and codegens" true
+    (contains_substr code "var_cache.perf_fd");
+  check bool "source emits grouped perf option assignment" true
+    (contains_substr code ".group_fd = __field_access_");
+  check bool "leader detach protection helper generated" true
+    (contains_substr code "perf_group_has_active_members_locked");
+  check bool "detach rejects active group leaders" true
+    (contains_substr code "Cannot detach perf group leader fd %d while active members exist")
+
 (* ── Type-checking regression tests ───────────────────────────────────── *)
 
 let parse_and_check source =
@@ -461,10 +591,14 @@ let tests = [
   test_case "perf_event_counting_starts_correctly"      `Quick test_perf_event_counting_starts_correctly;
   test_case "perf_event_period_and_wakeup_defaults"     `Quick test_perf_event_period_and_wakeup_defaults;
   test_case "perf_event_period_and_wakeup_custom"       `Quick test_perf_event_period_and_wakeup_custom;
+  test_case "perf_event_group_fd_codegen"               `Quick test_perf_event_group_fd_codegen;
+  test_case "perf_event_group_member_lifecycle_codegen" `Quick test_perf_event_group_member_lifecycle_codegen;
   test_case "perf_read_helpers_not_generated"           `Quick test_perf_read_helpers_not_generated;
   test_case "read_helpers_generated_when_used"          `Quick test_read_helpers_generated_when_used;
+  test_case "perf_read_helper_scales_multiplexed_counts"`Quick test_perf_read_helper_scales_multiplexed_counts;
   test_case "perf_attach_event_function_generated"      `Quick test_perf_attach_event_function_generated;
   test_case "detach_attach_concurrent_window"           `Quick test_detach_attach_concurrent_window;
+  test_case "perf_group_source_field_access_codegen"    `Quick test_perf_group_source_field_access_codegen;
   test_case "standard_attach_uses_libbpf_error_checks"  `Quick test_standard_attach_uses_libbpf_error_checks;
 ]
 

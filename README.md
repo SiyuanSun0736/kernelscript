@@ -306,7 +306,7 @@ fn on_branch_miss(ctx: *bpf_perf_event_data) -> i32 {
 fn main() -> i32 {
     var prog = load(on_branch_miss)
 
-    // Minimal form — defaults: pid=-1 (all procs), cpu=0,
+    // Minimal form — defaults: pid=-1 (all procs), cpu=0, group_fd=-1,
     // period=1_000_000, wakeup=1; perf attach flags must be 0
     var att = attach(prog, perf_options { perf_type: perf_type_hardware, perf_config: branch_misses }, 0)
     var count = read(att)
@@ -317,6 +317,19 @@ fn main() -> i32 {
     return 0
 }
 ```
+
+Perf events can share a kernel scheduling group by passing the leader attachment's `perf_fd` as `group_fd`:
+
+```kernelscript
+var cache = attach(prog, perf_options { perf_type: perf_type_hardware, perf_config: cache_misses }, 0)
+var branch = attach(prog, perf_options {
+    perf_type: perf_type_hardware,
+    perf_config: branch_misses,
+    group_fd: cache.perf_fd,
+}, 0)
+```
+
+Adding a member restarts the whole group from zero. Detach members before detaching their leader. `read(att)` still reads one attachment at a time; it returns a multiplex-scaled count when the kernel reports `time_running < time_enabled`. Group snapshot reads are not part of this first-stage API.
 
 **Available `perf_type` values:**
 
