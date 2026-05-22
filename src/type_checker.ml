@@ -226,7 +226,7 @@ let read_positive_int_file path =
   with _ -> None
 
 let detected_perf_group_max_events () =
-  match getenv_opt "KERNELSCRIPT_PERF_GROUP_MAX_EVENTS" with
+  let detected = match getenv_opt "KERNELSCRIPT_PERF_GROUP_MAX_EVENTS" with
   | Some value ->
       (match parse_positive_int value with
        | Some parsed -> parsed
@@ -241,6 +241,8 @@ let detected_perf_group_max_events () =
       (match List.find_map read_positive_int_file candidate_files with
        | Some detected -> detected
        | None -> 4)
+  in
+  min detected Stdlib.perf_read_max_values
 
 type perf_attach_group_ref = {
   perf_attach_name: string;
@@ -385,7 +387,8 @@ let validate_static_perf_event_groups_in_function func =
   in
 
   let max_group_events = detected_perf_group_max_events () in
-  let counts = Hashtbl.create 8 in
+  let slot_counts = Hashtbl.create 8 in
+  let member_counts = Hashtbl.create 8 in
   let positions = Hashtbl.create 8 in
   List.iter (fun attach ->
     let root =
@@ -394,7 +397,8 @@ let validate_static_perf_event_groups_in_function func =
       | Some _ -> root_of [] attach.perf_attach_name attach.perf_attach_pos
     in
     if Hashtbl.mem attachment_by_name root then (
-      Hashtbl.replace counts root (attach.perf_attach_pmu_slots + Option.value ~default:0 (hashtbl_find_opt counts root));
+      Hashtbl.replace slot_counts root (attach.perf_attach_pmu_slots + Option.value ~default:0 (hashtbl_find_opt slot_counts root));
+      Hashtbl.replace member_counts root (1 + Option.value ~default:0 (hashtbl_find_opt member_counts root));
       if not (Hashtbl.mem positions root) then
         Hashtbl.replace positions root attach.perf_attach_pos
     )
@@ -407,7 +411,16 @@ let validate_static_perf_event_groups_in_function func =
            "perf event group rooted at '%s' needs %d PMU counter slot(s), but target PMU group limit is %d; split the events into separate groups or reduce the group size"
            root count max_group_events)
         pos
-  ) counts
+  ) slot_counts;
+  Hashtbl.iter (fun root count ->
+    if count > max_group_events then
+      let pos = Option.value ~default:func.func_pos (hashtbl_find_opt positions root) in
+      type_error
+        (Printf.sprintf
+           "perf event group rooted at '%s' has %d member(s), but target perf group limit is %d; split the events into separate groups or reduce the group size"
+           root count max_group_events)
+        pos
+  ) member_counts
 
 let validate_static_perf_event_groups ast =
   List.iter (function
@@ -619,14 +632,10 @@ let builtin_return_type_for_call name arg_types default_return_type =
       Struct "PerfAttachment"
   | "detach", _ ->
       Void
-  | "read", _ ->
-      I64
-  | "read_raw", _ ->
-      I64
-  | "read_details", _ ->
-      Struct "PerfReadDetails"
-  | "read_group", _ ->
-      Struct "PerfGroupRead"
+  | "read", [arg_type] ->
+      (match Stdlib.read_dispatch_for_type arg_type with
+       | Some dispatch -> dispatch.Stdlib.read_return_type
+       | None -> default_return_type)
   | _ ->
       default_return_type
 

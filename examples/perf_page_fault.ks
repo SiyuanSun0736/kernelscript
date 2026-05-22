@@ -26,9 +26,9 @@ fn main() -> i32 {
         x = x + 1
     }
 
-    var page_fault_count = read(page)
+    var page_fault_count = read(page).scaled
     print("Page-fault count: %lld", page_fault_count)
-    var branch_count = read(branch)
+    var branch_count = read(branch).scaled
     print("Branch-miss count: %lld", branch_count)
 
     detach(page)

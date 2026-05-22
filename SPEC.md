@@ -482,8 +482,8 @@ fn main() -> i32 {
         group: cache,
     }, 0)
 
-    print("misses=%lld cache=%lld branch=%lld", read(misses), read(cache), read(branch))
-    var snapshot = read_group(cache)
+    print("misses=%lld cache=%lld branch=%lld", read(misses).scaled, read(cache).scaled, read(branch).scaled)
+    var snapshot = read(cache)
 
     detach(branch)
     detach(cache)  // IOC_DISABLE → bpf_link__destroy → close(perf_fd)
@@ -551,11 +551,7 @@ For event families with a richer config space, such as `perf_type_hw_cache`, pro
 |---|---|---|
 | `ks_open_perf_event` | `int (ks_perf_options)` | Calls `perf_event_open(2)`, returns fd |
 | `ks_attach_perf_event` | `PerfAttachment (int prog_fd, ks_perf_options, int flags)` | Full open-reset-attach-enable lifecycle |
-| `ks_read_perf_count` | `int64_t (int perf_fd)` | Reads current counter and applies multiplex scaling when needed |
-| `ks_perf_attachment_read` | `int64_t (PerfAttachment)` | Direct fd read through the attachment value with stale-handle detection |
-| `ks_perf_attachment_read_raw` | `int64_t (PerfAttachment)` | Direct raw counter read with stale-handle detection |
-| `ks_perf_attachment_read_details` | `PerfReadDetails (PerfAttachment)` | Returns raw, scaled, `time_enabled`, and `time_running` |
-| `ks_perf_attachment_read_group` | `PerfGroupRead (PerfAttachment)` | Reads a same-time group snapshot from a leader attachment |
+| `ks_perf_attachment_read` | `PerfRead (PerfAttachment)` | Direct fd snapshot through the attachment value with stale-handle detection |
 
 **Attach sequence for standalone events (compiler-generated, inside `ks_attach_perf_event`):**
 1. `ks_attr.attr.disabled = 1` — open counter without starting it  
@@ -570,19 +566,19 @@ For event families with a richer config space, such as `perf_type_hw_cache`, pro
 - Group members are opened disabled, linked to the BPF program, then the leader is disabled, reset, and enabled with `PERF_IOC_FLAG_GROUP`.
 - Adding a member to an already running group restarts the whole group from zero.
 - A group is scheduled as an atomic PMU unit. Separate events and separate groups may be multiplexed; members inside one group are not independently multiplexed. If a statically visible group needs more PMU counter slots than the target limit, compilation fails.
-- The compile-time group limit uses known sysfs PMU caps when available, falls back to `4`, and can be overridden with `KERNELSCRIPT_PERF_GROUP_MAX_EVENTS`.
+- The compile-time group limit uses known sysfs PMU caps when available, falls back to `4`, can be overridden with `KERNELSCRIPT_PERF_GROUP_MAX_EVENTS`, and is capped at the 16 entries exposed by `PerfRead`.
 - `perf_type_software` and `perf_type_tracepoint` do not consume PMU counter slots for this check; static hardware/raw/cache/breakpoint events consume one slot, and dynamic `perf_type` values are conservatively counted as one slot.
 - Detaching a member is allowed. Detaching a leader cascades to any live members.
-- `read_group(leader)` enables `PERF_FORMAT_GROUP | PERF_FORMAT_ID` and returns up to 16 same-time group values plus perf IDs and timing fields.
+- Generated perf events always enable `PERF_FORMAT_GROUP | PERF_FORMAT_ID`, and `read(leader)` returns up to 16 same-time group values plus perf IDs and timing fields.
 
 **Counter reads:**
-- Generated perf events request `PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING`.
-- `read(att)` returns the raw value when `time_enabled == time_running`.
-- If multiplexing occurred, `read(att)` returns `value * time_enabled / time_running` using a 128-bit intermediate.
-- If `time_running == 0`, `read(att)` reports an error and returns `-1`.
-- `read_raw(att)` returns the unscaled raw counter.
-- `read_details(att)` returns raw, scaled, `time_enabled`, and `time_running`.
-- `read_group(leader)` returns a snapshot struct; group `values[]` are scaled using the snapshot timing fields.
+- Generated perf events request `PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING | PERF_FORMAT_ID | PERF_FORMAT_GROUP`.
+- `read(att)` returns a `PerfRead` snapshot with `raw`, `scaled`, `time_enabled`, `time_running`, `count`, `values`, and `ids`.
+- `read(att).scaled` equals the raw value when `time_enabled == time_running`.
+- If multiplexing occurred, `read(att).scaled` is `value * time_enabled / time_running` using a 128-bit intermediate.
+- If `time_running == 0`, `read(att)` reports an error and returns `scaled == -1`.
+- `read(att).raw` returns the unscaled raw counter.
+- `read(leader).values[]` contains multiplex-scaled group values using the snapshot timing fields; `count == 1` for standalone events.
 
 **Detach sequence (compiler-generated):**
 1. `ioctl(perf_fd, PERF_EVENT_IOC_DISABLE, 0)` — stop counting  

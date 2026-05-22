@@ -117,7 +117,7 @@ if (result != 0) {
 // pid=-1 (all procs), cpu=0, period=1_000_000, wakeup=1; perf attach flags must be 0
 var perf_prog = load(on_branch_miss)
 var perf_att = attach(perf_prog, perf_options { perf_type: perf_type_hardware, perf_config: branch_misses }, 0)
-var count = read(perf_att)
+var count = read(perf_att).scaled
 detach(perf_att)
 detach(perf_prog)
 
@@ -132,7 +132,7 @@ detach(branch)
 detach(cache)
 ```
 
-Grouped events are scheduled as one atomic PMU unit. Separate events and separate groups may be multiplexed, but members inside one group cannot be independently multiplexed. Static groups that exceed the target PMU counter limit are rejected at compile time; override the detected/default limit with `KERNELSCRIPT_PERF_GROUP_MAX_EVENTS` when compiling for a different target.
+Grouped events are scheduled as one atomic PMU unit. Separate events and separate groups may be multiplexed, but members inside one group cannot be independently multiplexed. Static groups that exceed the target PMU counter limit are rejected at compile time; override the detected/default limit with `KERNELSCRIPT_PERF_GROUP_MAX_EVENTS` when compiling for a different target. The effective limit is capped at 16 to match `PerfRead`.
 
 **Context-specific implementations:**
 - **eBPF:** Not available
@@ -171,64 +171,24 @@ detach(prog)  // Clean up
 ---
 
 #### `read(handle)`
-**Signature:** `read(handle: PerfAttachment) -> i64`
+**Signature:** `read(handle: PerfAttachment) -> PerfRead`
 **Variadic:** No
 **Context:** Userspace only
 
-**Description:** Read the current hardware/software counter value from a perf attachment. If the kernel multiplexed the event, the value is scaled with `time_enabled / time_running`.
+**Description:** Read a perf attachment snapshot. The result includes this event's raw and scaled count, multiplex timing, and same-time group arrays.
 
 **Parameters:**
 - `handle`: Perf attachment returned from `attach(handle, perf_options, flags)`
 
 **Return Value:**
-- Returns the raw 64-bit counter value when no multiplexing occurred
-- Returns a scaled value when `time_running < time_enabled`
-- Returns `-1` on invalid/stale attachment or read failure
-- Reads use the attachment's `perf_fd` directly; the internal token detects copied handles used after detach.
-- Use `read_group(leader)` when you need a same-time group snapshot.
-
----
-
-#### `read_raw(handle)`
-**Signature:** `read_raw(handle: PerfAttachment) -> i64`
-**Variadic:** No
-**Context:** Userspace only
-
-**Description:** Read the unscaled raw hardware/software counter value from a perf attachment.
-
-**Return Value:**
-- Returns the raw counter value
-- Returns `-1` on invalid/stale attachment or read failure
-
----
-
-#### `read_details(handle)`
-**Signature:** `read_details(handle: PerfAttachment) -> PerfReadDetails`
-**Variadic:** No
-**Context:** Userspace only
-
-**Description:** Read raw, scaled, `time_enabled`, and `time_running` details for a perf attachment.
-
-**Return Value:**
-- `raw`: unscaled counter value
-- `scaled`: multiplex-corrected value, or `-1` on timing/read error
+- `raw`: this event's unscaled counter value, or `-1` on invalid/stale attachment or read failure
+- `scaled`: this event's multiplex-corrected value, or `-1` on timing/read error
 - `time_enabled`: perf enabled time
 - `time_running`: perf running time
-
----
-
-#### `read_group(leader)`
-**Signature:** `read_group(leader: PerfAttachment) -> PerfGroupRead`
-**Variadic:** No
-**Context:** Userspace only
-
-**Description:** Read a same-time snapshot from a perf event group leader. This enables `PERF_FORMAT_GROUP | PERF_FORMAT_ID` in generated perf events.
-
-**Return Value:**
-- `count`: number of entries returned, capped at 16
-- `values`: multiplex-scaled values from the snapshot
+- `count`: number of group entries returned; `1` for a standalone event
+- `values`: multiplex-scaled group values, capped at 16; `values[0] == scaled`
 - `ids`: perf event IDs for the returned values
-- `time_enabled` / `time_running`: timing fields used for scaling
+- Reads use the attachment's `perf_fd` directly; the internal token detects copied handles used after detach.
 
 ---
 

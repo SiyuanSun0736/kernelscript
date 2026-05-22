@@ -18,12 +18,12 @@ fn main() -> i32 {
     // branch joins cache's perf event group. Adding a member restarts the whole group from zero.
     var branch = attach(prog, perf_options { perf_type: perf_type_hardware, perf_config: branch_misses, period: 10000000, inherit: true, group: cache }, 0)
     print("Cache-miss and branch-miss perf_event demo attached")
-    var cache_count = read(cache)
+    var cache_count = read(cache).scaled
     print("Cache-miss count: %lld", cache_count)
-    var branch_count = read(branch)
+    var branch_count = read(branch).scaled
     print("Branch-miss count: %lld", branch_count)
     
-    var prev = read_details(cache)
+    var prev = read(cache)
     // Simulate workload with cache misses and branch misses.
     var x = 0
     var i = 0
@@ -34,7 +34,7 @@ fn main() -> i32 {
             x = x * 2
         }
     }
-    var cur = read_details(cache)
+    var cur = read(cache)
     var delta = cur.scaled - prev.scaled
     var dt_ns = cur.time_enabled - prev.time_enabled
     if (dt_ns > 0) {
@@ -42,7 +42,7 @@ fn main() -> i32 {
         print("Cache misses/sec: %lld", per_sec)
     }
 
-    var snapshot = read_group(cache)
+    var snapshot = read(cache)
     print("Grouped snapshot entries: %u", snapshot.count)
 
     var snapshot_index = 0

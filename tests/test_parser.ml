@@ -853,6 +853,7 @@ let test_function_calls () =
     ("print(42)", true);
     ("helper(x, y)", true);
     ("process()", true);
+    ("var scaled = read(cache).scaled", true);
   ] in
   List.iter (fun (input, should_pass) ->
     try

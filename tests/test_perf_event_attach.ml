@@ -257,8 +257,9 @@ let test_perf_event_group_fd_codegen () =
   check bool "read_format requests multiplex timing" true
     (contains_substr code "PERF_FORMAT_TOTAL_TIME_ENABLED" &&
      contains_substr code "PERF_FORMAT_TOTAL_TIME_RUNNING");
-  check bool "group snapshot format omitted until read_group is used" false
-    (contains_substr code "PERF_FORMAT_GROUP")
+  check bool "group snapshot format is always available" true
+    (contains_substr code "PERF_FORMAT_ID" &&
+     contains_substr code "PERF_FORMAT_GROUP")
 
 let test_perf_event_group_member_lifecycle_codegen () =
   let code = make_perf_code_with ~period:1000000L ~wakeup:1L in
@@ -325,7 +326,7 @@ let test_read_helpers_generated_when_used () =
       (IRStruct ("PerfAttachment", [("perf_fd", IRI32); ("link_id", IRI32); ("prog_fd", IRI32); ("generation", IRU64)]))
       test_pos
   in
-  let count_value = make_ir_value (IRVariable "count") IRI64 test_pos in
+  let count_value = make_ir_value (IRVariable "count") (IRStruct ("PerfRead", [])) test_pos in
   let attr_decl =
     make_ir_instruction
       (IRVariableDecl (attr_value, IRStruct ("perf_options", []),
@@ -343,12 +344,10 @@ let test_read_helpers_generated_when_used () =
       test_pos
   in
   let code = make_generated_code [attr_decl; attach_call; read_call] in
-  check bool "ks_read_perf_count helper generated when read is used" true
-    (contains_substr code "ks_read_perf_count");
   check bool "ks_perf_attachment_read helper generated when read is used" true
     (contains_substr code "ks_perf_attachment_read");
   check bool "read uses direct perf fd" true
-    (contains_substr code "ks_read_perf_count(attachment.perf_fd)");
+    (contains_substr code "ks_read_perf_from_fd(attachment.perf_fd");
   check bool "read begins with O(1) stale-handle guard" true
     (contains_substr code "perf_attachment_begin_read(attachment)");
   check bool "read does not duplicate perf fd" false
@@ -368,7 +367,7 @@ let test_perf_read_helper_scales_multiplexed_counts () =
       (IRStruct ("PerfAttachment", [("perf_fd", IRI32); ("link_id", IRI32); ("prog_fd", IRI32); ("generation", IRU64)]))
       test_pos
   in
-  let count_value = make_ir_value (IRVariable "count") IRI64 test_pos in
+  let count_value = make_ir_value (IRVariable "count") (IRStruct ("PerfRead", [])) test_pos in
   let attr_decl =
     make_ir_instruction
       (IRVariableDecl (attr_value, IRStruct ("perf_options", []),
@@ -386,8 +385,8 @@ let test_perf_read_helper_scales_multiplexed_counts () =
       test_pos
   in
   let code = make_generated_code [attr_decl; attach_call; read_call] in
-  check bool "read helper uses timing read struct" true
-    (contains_substr code "struct ks_perf_read_value");
+  check bool "read helper uses group snapshot buffer" true
+    (contains_substr code "struct ks_perf_group_read_buffer");
   check bool "read helper includes time_enabled" true
     (contains_substr code "uint64_t time_enabled;");
   check bool "read helper includes time_running" true
@@ -558,7 +557,7 @@ fn main() -> i32 {
   check bool "runtime prefers valid group attachment fd" true
     (contains_substr code "opts.group.perf_fd >= 0 && opts.group.link_id > 0 && opts.group.generation != 0")
 
-let test_perf_read_raw_details_and_group_codegen () =
+let test_perf_read_codegen () =
   let source = {|
 @perf_event
 fn on_event(ctx: *bpf_perf_event_data) -> i32 {
@@ -576,10 +575,10 @@ fn main() -> i32 {
         perf_config: branch_misses,
         group: cache,
     }, 0)
-    var raw = read_raw(cache)
-    var details = read_details(cache)
-    var snapshot = read_group(cache)
-    print("raw=%lld scaled=%lld group=%u", raw, details.scaled, snapshot.count)
+    var snapshot = read(cache)
+    var raw = snapshot.raw
+    var scaled = snapshot.scaled
+    print("raw=%lld scaled=%lld group=%u", raw, scaled, snapshot.count)
     var i = 0
     while (i < snapshot.count) {
         print("id=%llu value=%lld", snapshot.ids[i], snapshot.values[i])
@@ -592,15 +591,17 @@ fn main() -> i32 {
 }
 |} in
   let code = make_generated_code_from_source source in
-  check bool "raw read helper generated" true
+  check bool "unified read helper generated" true
+    (contains_substr code "PerfRead ks_perf_attachment_read");
+  check bool "old raw helper removed" false
     (contains_substr code "ks_perf_attachment_read_raw");
-  check bool "details read helper generated" true
-    (contains_substr code "PerfReadDetails ks_perf_attachment_read_details");
-  check bool "group read helper generated" true
-    (contains_substr code "PerfGroupRead ks_perf_attachment_read_group");
+  check bool "old details helper removed" false
+    (contains_substr code "ks_perf_attachment_read_details");
+  check bool "old group helper removed" false
+    (contains_substr code "ks_perf_attachment_read_group");
   check bool "group snapshot buffer generated" true
     (contains_substr code "struct ks_perf_group_read_buffer");
-  check bool "read_group enables group read format" true
+  check bool "read enables group read format" true
     (contains_substr code "PERF_FORMAT_ID" && contains_substr code "PERF_FORMAT_GROUP");
   check bool "group values are multiplex scaled" true
     (contains_substr code "ks_scale_perf_count(group.values[i].value")
@@ -662,6 +663,86 @@ fn main() -> i32 {
         (contains_substr msg "perf event group rooted at 'cache' needs 5 PMU counter slot(s), but target PMU group limit is 4")
   | exn ->
       fail ("Expected Type_error for oversized perf event group, got " ^ Printexc.to_string exn)
+
+let test_perf_group_too_many_static_members_rejected () =
+  Unix.putenv "KERNELSCRIPT_PERF_GROUP_MAX_EVENTS" "32";
+  let member_decls =
+    List.init 16 (fun i ->
+      Printf.sprintf {|
+    var sw%d = attach(prog, perf_options {
+        perf_type: perf_type_software,
+        perf_config: context_switches,
+        group: leader,
+    }, 0)|} i)
+    |> String.concat "\n"
+  in
+  let source = {|
+@perf_event
+fn on_event(ctx: *bpf_perf_event_data) -> i32 {
+    return 0
+}
+
+fn main() -> i32 {
+    var prog = load(on_event)
+    var leader = attach(prog, perf_options {
+        perf_type: perf_type_software,
+        perf_config: page_faults,
+    }, 0)
+|} ^ member_decls ^ {|
+    detach(leader)
+    detach(prog)
+    return 0
+}
+|} in
+  try
+    let _ = make_generated_code_from_source source in
+    fail "Static perf event group with more than 16 members should be rejected"
+  with
+  | Type_error (msg, _) ->
+      check bool "oversized group reports clamped perf group limit" true
+        (contains_substr msg "perf event group rooted at 'leader' has 17 member(s), but target perf group limit is 16")
+  | exn ->
+      fail ("Expected Type_error for oversized perf event member count, got " ^ Printexc.to_string exn)
+
+let test_perf_group_env_override_clamped_to_read_capacity () =
+  Unix.putenv "KERNELSCRIPT_PERF_GROUP_MAX_EVENTS" "32";
+  let member_decls =
+    List.init 16 (fun i ->
+      Printf.sprintf {|
+    var hw%d = attach(prog, perf_options {
+        perf_type: perf_type_hardware,
+        perf_config: branch_misses,
+        group: leader,
+    }, 0)|} i)
+    |> String.concat "\n"
+  in
+  let source = {|
+@perf_event
+fn on_event(ctx: *bpf_perf_event_data) -> i32 {
+    return 0
+}
+
+fn main() -> i32 {
+    var prog = load(on_event)
+    var leader = attach(prog, perf_options {
+        perf_type: perf_type_hardware,
+        perf_config: cache_misses,
+    }, 0)
+|} ^ member_decls ^ {|
+    detach(leader)
+    detach(prog)
+    return 0
+}
+|} in
+  try
+    let _ = make_generated_code_from_source source in
+    fail "Perf group limit override above PerfRead capacity should be clamped"
+  with
+  | Type_error (msg, _) ->
+      check bool "oversized group reports clamped PMU group limit" true
+        (contains_substr msg "perf event group rooted at 'leader' needs 17 PMU counter slot(s), but target PMU group limit is 16")
+  | exn ->
+      fail ("Expected Type_error for clamped perf event group limit, got " ^ Printexc.to_string exn)
 
 (* ── Type-checking regression tests ───────────────────────────────────── *)
 
@@ -740,8 +821,10 @@ let tests = [
   test_case "detach_attach_concurrent_window"           `Quick test_detach_attach_concurrent_window;
   test_case "perf_group_source_field_access_codegen"    `Quick test_perf_group_source_field_access_codegen;
   test_case "perf_group_attachment_field_codegen"       `Quick test_perf_group_attachment_field_codegen;
-  test_case "perf_read_raw_details_and_group_codegen"   `Quick test_perf_read_raw_details_and_group_codegen;
+  test_case "perf_read_codegen"                         `Quick test_perf_read_codegen;
   test_case "perf_group_too_large_static_group_rejected" `Quick test_perf_group_too_large_static_group_rejected;
+  test_case "perf_group_too_many_static_members_rejected" `Quick test_perf_group_too_many_static_members_rejected;
+  test_case "perf_group_env_override_clamped_to_read_capacity" `Quick test_perf_group_env_override_clamped_to_read_capacity;
   test_case "standard_attach_uses_libbpf_error_checks"  `Quick test_standard_attach_uses_libbpf_error_checks;
 ]
 

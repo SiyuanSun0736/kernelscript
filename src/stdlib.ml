@@ -109,6 +109,22 @@ let validate_register_function arg_types ast_context _pos =
     | _ -> 
         (false, Some "register() requires an impl block argument")
 
+(** Read dispatch metadata keyed by argument type.
+    This keeps read() trait-shaped even while only PerfAttachment is supported. *)
+type read_dispatch = {
+  read_return_type: bpf_type;
+  read_userspace_impl: string;
+}
+
+let read_dispatch_for_type = function
+  | Struct "PerfAttachment"
+  | UserType "PerfAttachment" ->
+      Some {
+        read_return_type = Struct "PerfRead";
+        read_userspace_impl = "ks_perf_attachment_read";
+      }
+  | _ -> None
+
 (** Validation function for attach() - accepts standard 3-arg form, and perf_options 3-arg form *)
 let validate_attach_function arg_types _ast_context _pos =
   match arg_types with
@@ -124,17 +140,12 @@ let validate_attach_function arg_types _ast_context _pos =
 (** Validation function for read() - currently only accepts perf attachment values *)
 let validate_read_function arg_types _ast_context _pos =
   match arg_types with
-  | [Struct "PerfAttachment"] | [UserType "PerfAttachment"] ->
-      (true, None)
+  | [arg_type] ->
+      (match read_dispatch_for_type arg_type with
+       | Some _ -> (true, None)
+       | None -> (false, Some "read() currently requires a PerfAttachment"))
   | _ ->
-      (false, Some "read() currently requires a PerfAttachment")
-
-let validate_read_group_function arg_types _ast_context _pos =
-  match arg_types with
-  | [Struct "PerfAttachment"] | [UserType "PerfAttachment"] ->
-      (true, None)
-  | _ ->
-      (false, Some "read_group() requires a PerfAttachment group leader")
+      (false, Some "read() currently requires exactly one argument")
 
 (** Validation function for detach() - accepts program handles and perf attachments *)
 let validate_detach_function arg_types _ast_context _pos =
@@ -250,46 +261,13 @@ let builtin_functions = [
   {
     name = "read";
     param_types = []; (* Custom validation handles attachment-aware overloads *)
-    return_type = I64; (* Raw counter value, or -1 on error *)
-    description = "Read the multiplex-scaled hardware/software counter value for a perf attachment";
+    return_type = Struct "PerfRead";
+    description = "Read raw/scaled/timing values and group snapshot arrays for a perf attachment";
     is_variadic = false;
     ebpf_impl = ""; (* Not available in eBPF context *)
     userspace_impl = "ks_perf_attachment_read";
     kernel_impl = "";
     validate = Some validate_read_function;
-  };
-  {
-    name = "read_raw";
-    param_types = [];
-    return_type = I64;
-    description = "Read the raw hardware/software counter value for a perf attachment";
-    is_variadic = false;
-    ebpf_impl = "";
-    userspace_impl = "ks_perf_attachment_read_raw";
-    kernel_impl = "";
-    validate = Some validate_read_function;
-  };
-  {
-    name = "read_details";
-    param_types = [];
-    return_type = Struct "PerfReadDetails";
-    description = "Read raw, scaled, time_enabled, and time_running for a perf attachment";
-    is_variadic = false;
-    ebpf_impl = "";
-    userspace_impl = "ks_perf_attachment_read_details";
-    kernel_impl = "";
-    validate = Some validate_read_function;
-  };
-  {
-    name = "read_group";
-    param_types = [];
-    return_type = Struct "PerfGroupRead";
-    description = "Read a same-time snapshot from a perf event group leader";
-    is_variadic = false;
-    ebpf_impl = "";
-    userspace_impl = "ks_perf_attachment_read_group";
-    kernel_impl = "";
-    validate = Some validate_read_group_function;
   };
 ]
 
@@ -330,6 +308,8 @@ let get_kernel_implementation name =
 
 (** Builtin type definitions *)
 let builtin_pos = { line = 0; column = 0; filename = "<builtin>" }
+
+let perf_read_max_values = 16
 
 let builtin_types = [
   (* Standard C types as type aliases *)
@@ -406,19 +386,14 @@ let builtin_types = [
     ("generation", U64);
   ], builtin_pos));
 
-  TypeDef (StructDef ("PerfReadDetails", [
+  TypeDef (StructDef ("PerfRead", [
     ("raw", I64);
     ("scaled", I64);
     ("time_enabled", U64);
     ("time_running", U64);
-  ], builtin_pos));
-
-  TypeDef (StructDef ("PerfGroupRead", [
     ("count", U32);
-    ("values", Array (I64, 16));
-    ("ids", Array (U64, 16));
-    ("time_enabled", U64);
-    ("time_running", U64);
+    ("values", Array (I64, perf_read_max_values));
+    ("ids", Array (U64, perf_read_max_values));
   ], builtin_pos));
 ]
 

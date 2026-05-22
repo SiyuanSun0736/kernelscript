@@ -294,7 +294,7 @@ fn main() -> i32 {
 
 ### Hardware Performance Counter Programs
 
-Use `@perf_event` to attach eBPF programs to hardware or software performance counters. `perf_options` keeps the kernel's tagged `perf_type + perf_config` model, so adding new perf event families does not require flattening everything into one enum. Only `perf_type` and `perf_config` are required; all other fields have sensible defaults. Perf attaches return a first-class attachment value, so if you need the current count in userspace, call `read(att)`:
+Use `@perf_event` to attach eBPF programs to hardware or software performance counters. `perf_options` keeps the kernel's tagged `perf_type + perf_config` model, so adding new perf event families does not require flattening everything into one enum. Only `perf_type` and `perf_config` are required; all other fields have sensible defaults. Perf attaches return a first-class attachment value, so if you need the current count in userspace, call `read(att).scaled`:
 
 ```kernelscript
 // eBPF program fires on every hardware branch-miss sample
@@ -309,7 +309,7 @@ fn main() -> i32 {
     // Minimal form — defaults: pid=-1 (all procs), cpu=0, no group,
     // period=1_000_000, wakeup=1; perf attach flags must be 0
     var att = attach(prog, perf_options { perf_type: perf_type_hardware, perf_config: branch_misses }, 0)
-    var count = read(att)
+    var count = read(att).scaled
     print("branch misses: %lld", count)
 
     detach(att)    // disables counter, destroys BPF link, closes fd
@@ -330,9 +330,9 @@ var branch = attach(prog, perf_options {
 }, 0)
 ```
 
-Adding a member restarts the whole group from zero. Detaching a leader cascades to any live members. A group competes for PMU counters as one atomic unit: different groups can be multiplexed over time, but members inside one group are not independently multiplexed. For statically visible groups, the compiler rejects groups that need more PMU counter slots than the target limit. The limit is read from known sysfs PMU caps when available, defaults to 4, and can be overridden with `KERNELSCRIPT_PERF_GROUP_MAX_EVENTS`.
+Adding a member restarts the whole group from zero. Detaching a leader cascades to any live members. A group competes for PMU counters as one atomic unit: different groups can be multiplexed over time, but members inside one group are not independently multiplexed. For statically visible groups, the compiler rejects groups that need more PMU counter slots than the target limit. The limit is read from known sysfs PMU caps when available, defaults to 4, can be overridden with `KERNELSCRIPT_PERF_GROUP_MAX_EVENTS`, and is capped at 16 to match `PerfRead`.
 
-`read(att)` returns a multiplex-scaled count when the kernel reports `time_running < time_enabled`. Use `read_raw(att)` for the raw value, `read_details(att)` for raw/scaled/timing details, and `read_group(leader)` for a same-time group snapshot.
+`read(att)` returns a `PerfRead` snapshot with raw, multiplex-scaled, timing, and group fields. Use `read(att).scaled` for the common counter value, `read(att).raw` for the unscaled value, and `read(att).values` / `read(att).ids` for a same-time group snapshot.
 
 **Available `perf_type` values:**
 

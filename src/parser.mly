@@ -145,7 +145,6 @@
 %type <Ast.catch_pattern> catch_pattern
 %type <Ast.expr> expression
 %type <Ast.expr> primary_expression
-%type <Ast.expr> function_call
 %type <Ast.expr> array_access
 %type <Ast.expr> struct_literal
 %type <Ast.expr> match_expression
@@ -462,7 +461,6 @@ defer_statement:
 /* Expressions - Conservative approach with precedence declarations */
 expression:
   | primary_expression { $1 }
-  | function_call { $1 }
   | array_access { $1 }
   | struct_literal { $1 }
   | match_expression { $1 }
@@ -492,16 +490,10 @@ primary_expression:
   | LPAREN expression RPAREN { $2 }
   | primary_expression DOT field_name { make_expr (FieldAccess ($1, $3)) (make_pos ()) }
   | primary_expression ARROW field_name { make_expr (ArrowAccess ($1, $3)) (make_pos ()) }
-  | NEW bpf_type LPAREN RPAREN { make_expr (New $2) (make_pos ()) }
-  | NEW bpf_type LPAREN expression RPAREN { make_expr (NewWithFlag ($2, $4)) (make_pos ()) }
-
-function_call:
-  | IDENTIFIER LPAREN argument_list RPAREN
-    { make_expr (Call (make_expr (Identifier $1) (make_pos ()), $3)) (make_pos ()) }
   | primary_expression LPAREN argument_list RPAREN
     { make_expr (Call ($1, $3)) (make_pos ()) }
-
-
+  | NEW bpf_type LPAREN RPAREN { make_expr (New $2) (make_pos ()) }
+  | NEW bpf_type LPAREN expression RPAREN { make_expr (NewWithFlag ($2, $4)) (make_pos ()) }
 
 array_access:
   | expression LBRACKET expression RBRACKET { make_expr (ArrayAccess ($1, $3)) (make_pos ()) }
