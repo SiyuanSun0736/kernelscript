@@ -346,8 +346,8 @@ let test_read_helpers_generated_when_used () =
   let code = make_generated_code [attr_decl; attach_call; read_call] in
   check bool "ks_perf_attachment_read helper generated when read is used" true
     (contains_substr code "ks_perf_attachment_read");
-  check bool "read uses direct perf fd" true
-    (contains_substr code "ks_read_perf_from_fd(attachment.perf_fd");
+  check bool "read loads event id from internal attachment state" true
+    (contains_substr code "atomic_load_explicit(&state->event_id, memory_order_acquire)");
   check bool "read begins with O(1) stale-handle guard" true
     (contains_substr code "perf_attachment_begin_read(attachment)");
   check bool "read does not duplicate perf fd" false
@@ -440,6 +440,8 @@ let test_perf_attach_event_function_generated () =
     (contains_substr code "typedef struct PerfAttachment");
   check bool "PerfAttachment carries stale-handle generation" true
     (contains_substr code "uint64_t generation;");
+  check bool "perf attach records kernel perf event id" true
+    (contains_substr code "PERF_EVENT_IOC_ID");
   check bool "perf attach gets id directly from add_attachment" true
     (contains_substr code "BPF_PROG_TYPE_PERF_EVENT, &attachment_id, &generation");
   check bool "perf attach no longer scans table after add_attachment" false
@@ -606,6 +608,8 @@ fn main() -> i32 {
   check bool "group values are multiplex scaled" true
     (contains_substr code "ks_scale_perf_count(group.values[i].value")
   ;
+  check bool "read selects the matching attachment event id" true
+    (contains_substr code "group.values[i].id == event_id");
   check bool "array field snapshots are copied before indexing" true
     (contains_substr code "memcpy(__field_access_");
   check bool "array snapshot indexing dereferences element pointer" true

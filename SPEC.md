@@ -569,16 +569,16 @@ For event families with a richer config space, such as `perf_type_hw_cache`, pro
 - The compile-time group limit uses known sysfs PMU caps when available, falls back to `4`, can be overridden with `KERNELSCRIPT_PERF_GROUP_MAX_EVENTS`, and is capped at the 16 entries exposed by `PerfRead`.
 - `perf_type_software` and `perf_type_tracepoint` do not consume PMU counter slots for this check; static hardware/raw/cache/breakpoint events consume one slot, and dynamic `perf_type` values are conservatively counted as one slot.
 - Detaching a member is allowed. Detaching a leader cascades to any live members.
-- Generated perf events always enable `PERF_FORMAT_GROUP | PERF_FORMAT_ID`, and `read(leader)` returns up to 16 same-time group values plus perf IDs and timing fields.
+- Generated perf events always enable `PERF_FORMAT_GROUP | PERF_FORMAT_ID`, and `read(att)` returns up to 16 same-time group values plus perf IDs and timing fields. `raw` and `scaled` select the entry matching the attachment being read.
 
 **Counter reads:**
 - Generated perf events request `PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING | PERF_FORMAT_ID | PERF_FORMAT_GROUP`.
 - `read(att)` returns a `PerfRead` snapshot with `raw`, `scaled`, `time_enabled`, `time_running`, `count`, `values`, and `ids`.
-- `read(att).scaled` equals the raw value when `time_enabled == time_running`.
+- `read(att).scaled` equals this attachment's raw value when `time_enabled == time_running`.
 - If multiplexing occurred, `read(att).scaled` is `value * time_enabled / time_running` using a 128-bit intermediate.
 - If `time_running == 0`, `read(att)` reports an error and returns `scaled == -1`.
-- `read(att).raw` returns the unscaled raw counter.
-- `read(leader).values[]` contains multiplex-scaled group values using the snapshot timing fields; `count == 1` for standalone events.
+- `read(att).raw` returns this attachment's unscaled raw counter.
+- `read(att).values[]` contains multiplex-scaled group values using the snapshot timing fields; `count == 1` for standalone events.
 
 **Detach sequence (compiler-generated):**
 1. `ioctl(perf_fd, PERF_EVENT_IOC_DISABLE, 0)` — stop counting  

@@ -175,7 +175,7 @@ detach(prog)  // Clean up
 **Variadic:** No
 **Context:** Userspace only
 
-**Description:** Read a perf attachment snapshot. The result includes this event's raw and scaled count, multiplex timing, and same-time group arrays.
+**Description:** Read a perf attachment snapshot. The result includes this attachment's raw and scaled count, multiplex timing, and same-time group arrays.
 
 **Parameters:**
 - `handle`: Perf attachment returned from `attach(handle, perf_options, flags)`

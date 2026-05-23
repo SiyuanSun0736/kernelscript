@@ -4190,6 +4190,7 @@ void cleanup_bpf_maps(void) {
       {|  struct perf_attachment_state {
     _Atomic uint64_t generation;
     _Atomic int perf_fd;
+    _Atomic uint64_t event_id;
     _Atomic unsigned int readers;
   };
 
@@ -4250,6 +4251,7 @@ void cleanup_bpf_maps(void) {
       for (size_t i = 0; i < KS_PERF_STATE_CHUNK_SIZE; i++) {
         atomic_init(&chunk[i].generation, 0);
         atomic_init(&chunk[i].perf_fd, -1);
+        atomic_init(&chunk[i].event_id, 0);
         atomic_init(&chunk[i].readers, 0);
       }
       atomic_store_explicit(&perf_state_chunks[chunk_idx], chunk, memory_order_release);
@@ -4272,6 +4274,7 @@ void cleanup_bpf_maps(void) {
       while (atomic_load_explicit(&state->readers, memory_order_acquire) != 0) {
         sched_yield();
       }
+      atomic_store_explicit(&state->event_id, 0, memory_order_release);
     }
     entry->generation = 0;
   }
@@ -5118,6 +5121,7 @@ PerfAttachment ks_attach_perf_event(int prog_fd, ks_perf_options opts, int flags
         .perf_fd = -1,
         .link_id = -1,
         .prog_fd = prog_fd,
+        .generation = 0,
     };
 
     if (flags != 0) {
@@ -5146,6 +5150,13 @@ PerfAttachment ks_attach_perf_event(int prog_fd, ks_perf_options opts, int flags
     bool is_group_member = effective_group_fd >= 0;
     int perf_fd = ks_open_perf_event(opts);
     if (perf_fd < 0) return attachment;
+
+    uint64_t event_id = 0;
+    if (ioctl(perf_fd, PERF_EVENT_IOC_ID, &event_id) != 0) {
+        fprintf(stderr, "Failed to get perf event id for fd %d: %s\n", perf_fd, strerror(errno));
+        close(perf_fd);
+        return attachment;
+    }
 
     struct bpf_program *prog = find_prog_by_fd(prog_fd);
     if (!prog) {
@@ -5210,6 +5221,11 @@ PerfAttachment ks_attach_perf_event(int prog_fd, ks_perf_options opts, int flags
         return attachment;
     }
 
+    struct perf_attachment_state *state = perf_state_slot_lookup(perf_fd);
+    if (state) {
+        atomic_store_explicit(&state->event_id, event_id, memory_order_release);
+    }
+
     attachment.perf_fd = perf_fd;
     attachment.link_id = attachment_id;
     attachment.generation = generation;
@@ -5249,7 +5265,7 @@ static int64_t ks_scale_perf_count(uint64_t value, uint64_t time_enabled, uint64
   return (int64_t)scaled;
 }
 
-static int ks_read_perf_from_fd(int perf_fd, PerfRead *result, const char *caller) {
+static int ks_read_perf_from_fd(int perf_fd, uint64_t event_id, PerfRead *result, const char *caller) {
   if (perf_fd < 0) {
     fprintf(stderr, "%s: invalid perf_fd %d\n", caller, perf_fd);
     return -1;
@@ -5314,8 +5330,29 @@ static int ks_read_perf_from_fd(int perf_fd, PerfRead *result, const char *calle
       ks_scale_perf_count(group.values[i].value, group.time_enabled, group.time_running,
                           caller, perf_fd);
   }
-  result->raw = (int64_t)group.values[0].value;
-  result->scaled = result->values[0];
+
+  uint32_t selected_index = 0;
+  if (event_id != 0) {
+    bool found = false;
+    for (uint32_t i = 0; i < result->count; i++) {
+      if (group.values[i].id == event_id) {
+        selected_index = i;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      fprintf(stderr,
+          "%s: perf event id %llu not found in group read from fd %d\n",
+          caller,
+          (unsigned long long)event_id,
+          perf_fd);
+      return -1;
+    }
+  }
+
+  result->raw = (int64_t)group.values[selected_index].value;
+  result->scaled = result->values[selected_index];
   return result->scaled < 0 ? -1 : 0;
 }
 
@@ -5333,7 +5370,8 @@ PerfRead ks_perf_attachment_read(PerfAttachment attachment) {
     fprintf(stderr, "ks_perf_attachment_read: invalid or stale perf attachment\n");
     return result;
   }
-  (void)ks_read_perf_from_fd(attachment.perf_fd, &result, "ks_perf_attachment_read");
+  uint64_t event_id = atomic_load_explicit(&state->event_id, memory_order_acquire);
+  (void)ks_read_perf_from_fd(attachment.perf_fd, event_id, &result, "ks_perf_attachment_read");
   perf_attachment_end_read(state);
   return result;
 }

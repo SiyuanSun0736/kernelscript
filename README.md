@@ -332,7 +332,7 @@ var branch = attach(prog, perf_options {
 
 Adding a member restarts the whole group from zero. Detaching a leader cascades to any live members. A group competes for PMU counters as one atomic unit: different groups can be multiplexed over time, but members inside one group are not independently multiplexed. For statically visible groups, the compiler rejects groups that need more PMU counter slots than the target limit. The limit is read from known sysfs PMU caps when available, defaults to 4, can be overridden with `KERNELSCRIPT_PERF_GROUP_MAX_EVENTS`, and is capped at 16 to match `PerfRead`.
 
-`read(att)` returns a `PerfRead` snapshot with raw, multiplex-scaled, timing, and group fields. Use `read(att).scaled` for the common counter value, `read(att).raw` for the unscaled value, and `read(att).values` / `read(att).ids` for a same-time group snapshot.
+`read(att)` returns a `PerfRead` snapshot with raw, multiplex-scaled, timing, and group fields. Use `read(att).scaled` for that attachment's counter value, `read(att).raw` for its unscaled value, and `read(att).values` / `read(att).ids` for a same-time group snapshot.
 
 **Available `perf_type` values:**
 
